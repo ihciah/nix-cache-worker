@@ -1,0 +1,33 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nix-cache",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "DEFAULT_STORE_DIR": "/nix/store",
+    "DEFAULT_PRIORITY": "40",
+    "DEFAULT_WANT_MASS_QUERY": "1",
+    "DEFAULT_RETENTION_DAYS": "7",
+    "NIX_PUBLIC_SIGN_KEY": ""
+  },
+  "r2_buckets": [
+    {
+      "binding": "CACHE_BUCKET",
+      "bucket_name": "replace-with-r2-bucket-name",
+      "preview_bucket_name": "replace-with-r2-preview-bucket-name"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "replace-with-d1-database-name",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "preview_database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "triggers": {
+    "crons": ["0 3 * * *"]
+  }
+}

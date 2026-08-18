@@ -1,0 +1,42 @@
+# Dependencies and package-manager output
+node_modules/
+
+# Wrangler and Cloudflare local state
+.wrangler/
+wrangler.jsonc
+wrangler.local.jsonc
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# Environment files and local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.sec
+*.secret
+secrets/
+
+# Build, test, and coverage output
+dist/
+build/
+coverage/
+.cache/
+.vite/
+
+# Logs and temporary files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

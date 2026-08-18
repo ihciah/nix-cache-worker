@@ -1,0 +1,385 @@
+# Nix Cache Worker
+
+Nix Cache Worker is a Cloudflare Worker that provides an HTTP binary cache for Nix. It stores cache objects in Cloudflare R2 and keeps searchable package/version membership, retention policy, pin state, and garbage-collection state in Cloudflare D1.
+
+This project is the storage target for CI-driven package publishing. CI is responsible for building packages and uploading them; this Worker does not build packages or orchestrate releases.
+
+> **Status:** The v1 Worker implementation is present. Configure real R2/D1 bindings and Worker Secrets before deployment, then run the Nix end-to-end acceptance checks listed below.
+
+## Product shape
+
+One deployed Worker exposes two services on the same hostname:
+
+1. A standard Nix HTTP binary cache for public reads and authenticated writes.
+2. An authenticated web console and management API for packages, build versions, files, retention, pins, and garbage collection.
+
+The HTTP layer uses Hono. Storage and lifecycle behavior stays in explicit R2, D1, domain, and job modules.
+
+The storage responsibilities are deliberately separated:
+
+- **R2** is the source of truth for object bytes.
+- **D1** is the index and control plane for objects and package/version metadata.
+- **Worker Secrets** are the source of truth for bearer tokens.
+
+The cache is designed to work directly with `nix copy --to` and `nix copy --from`.
+
+## Cache API
+
+The cache uses the conventional Nix binary-cache paths.
+
+| Method | Path | Purpose | Auth |
+| --- | --- | --- | --- |
+| `GET`, `HEAD` | `/nix-cache-info` | Cache capability metadata | Public read or read token |
+| `GET`, `HEAD` | `/<hash>.narinfo` | NAR metadata | Public read or read token |
+| `GET`, `HEAD` | `/nar/<path>` | NAR payload | Public read or read token |
+| `PUT` | `/<hash>.narinfo` | Upload NAR metadata | Write or admin token |
+| `PUT` | `/nar/<path>` | Upload NAR payload | Write or admin token |
+
+### HTTP behavior
+
+- `GET` and `HEAD` return the same cache metadata headers; `HEAD` does not return a body.
+- NAR payloads support byte ranges with `Range`, `206 Partial Content`, `Content-Range`, and `416 Range Not Satisfiable` where appropriate.
+- Every object response includes an object ETag and the correct `Content-Length` for the selected representation or byte range.
+- `If-None-Match` returns `304 Not Modified` when the supplied ETag matches.
+- `If-Match` is enforced for conditional writes and returns `412 Precondition Failed` when it does not match.
+- Missing objects return `404 Not Found`.
+- Malformed narinfo returns `422 Unprocessable Content`; a narinfo whose NAR dependency is missing returns `424 Failed Dependency`.
+- Cache objects are immutable. A repeated PUT with identical bytes is an idempotent success; a PUT with different bytes never overwrites the existing object and returns a conflict response.
+- R2 multipart upload is used internally for large NAR payloads. Clients continue to use the normal Nix `PUT` protocol; no custom multipart client API is required.
+- The Worker uses Cloudflare's `caches.default` for successful full GET
+  responses and `/nix-cache-info`. HEAD can reuse a cached full GET; Range and
+  conditional requests continue through the R2 path. Cache generations change
+  when version metadata, retention rules, settings, or deletion state changes.
+
+### Cache-Control defaults
+
+| Path | Header |
+| --- | --- |
+| Unclassified `/nar/*` or `*.narinfo` | `public, max-age=21600` (NAR responses also include `immutable`) |
+| Version-associated `/nar/*` or `*.narinfo` | `public, max-age=<effective retention in seconds>` (NAR responses also include `immutable`) |
+| `/nix-cache-info` | `public, max-age=300` |
+
+Objects uploaded before version registration are intentionally served with a
+six-hour TTL. Once a narinfo is associated with an active version, both the
+narinfo and its referenced NAR use the longest effective finite retention among
+their active versions. A version-level `retentionDays` override wins for that
+version; otherwise the largest matching structured rule duration and then the
+system default are used. This TTL is calculated when serving the response, so
+registering or updating a version does not require rewriting immutable R2 bytes.
+
+### `nix-cache-info`
+
+The Worker returns the standard cache information document, including the configured store directory, `WantMassQuery`, and cache priority. The response is intentionally short-lived so cache metadata changes can propagate without delaying NAR downloads.
+
+### NARINFO consistency
+
+When a `.narinfo` is uploaded, the Worker parses the referenced NAR URL and verifies that the NAR object already exists in R2 and in the D1 object index. The narinfo is rejected when the referenced NAR is missing.
+
+The supported upload order is therefore:
+
+1. Upload the NAR payload.
+2. Upload the corresponding `.narinfo`.
+3. Optionally register the resulting narinfo objects into a package version.
+
+This strict mode avoids serving metadata for an unavailable payload. The implementation must preserve this invariant even when uploads are retried or completed through multipart upload.
+
+## Authentication
+
+API requests use a simple bearer token:
+
+```http
+Authorization: Bearer <token>
+```
+
+For compatibility with the stock Nix HTTP uploader, the Worker also accepts
+HTTP Basic credentials produced from a Nix `netrc` entry. The netrc password
+must be the matching Worker Secret token; the username is ignored. Use this
+only over HTTPS:
+
+```text
+machine nix-cache.example.com login nix password <write-token>
+```
+
+Bearer authentication remains the canonical API format. The Basic form exists
+only because `nix copy --to` does not provide a custom Bearer header option.
+
+The three tokens have separate roles:
+
+| Principal | Read cache | Write cache | Register versions | Manage policy | Pin/unpin versions | Run GC | Delete versions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| anonymous | Yes | No | No | No | No | No | No |
+| `read-token` | Yes | No | No | No | No | No | No |
+| `write-token` | Yes | Yes | Yes | No | No | No | No |
+| `admin-token` | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+
+Tokens are configured as Worker Secrets:
+
+```text
+READ_TOKEN
+WRITE_TOKEN
+ADMIN_TOKEN
+```
+
+Tokens must never be stored in source code, D1, URLs, cookies, browser persistent storage beyond the current tab session, or application logs. The web console stores a validated admin token only in same-origin `sessionStorage`, so a refresh in the same browser tab does not require another login. The token is cleared when the tab's page session ends and is never stored in `localStorage`.
+
+R2 buckets and D1 databases are Worker bindings and must be configured with Wrangler or the Cloudflare Dashboard. The application web console manages runtime policy and package/version metadata; it cannot rewrite Worker bindings or Worker Secrets.
+
+The public home page (`/`) opens with a client configuration guide containing
+the official `cache.nixos.org` entries alongside this cache and the configured
+`NIX_PUBLIC_SIGN_KEY`. When the public key variable is unset, the guide shows a
+placeholder. The authenticated console keeps operational and CI publishing
+instructions at the end of the page; the login page is unchanged.
+
+## Packages, versions, and files
+
+The management model is explicitly hierarchical:
+
+- A **package** is a stable package name such as `hello`.
+- A **version** is one opaque build identity within a package, identified by
+  `(packageName, versionName)` and ordered by `registered_at`.
+- A **file** is a narinfo member and its referenced NAR payload. A version can
+  contain many narinfo/NAR file pairs, while shared payloads remain normalized.
+
+Version names are required but are never parsed as semantic versions. Tags are
+optional metadata on a version and use arbitrary string keys and values.
+
+### CI version registration API
+
+```http
+PUT /api/packages/{packageName}/versions/{versionName}
+Authorization: Bearer <write-token>
+Content-Type: application/json
+```
+
+Example request:
+
+```json
+{
+  "narinfoKeys": ["<hash-a>.narinfo", "<hash-b>.narinfo"],
+  "tags": {
+    "channel": "stable"
+  },
+  "retentionDays": 30
+}
+```
+
+The registration endpoint is idempotent. It verifies that referenced narinfo
+objects and their NAR payloads exist before adding the version membership
+relation. Cache object bytes remain immutable, while authorized version
+membership, tags, and the version retention override may be updated.
+
+`PUT` is a complete declaration: omitted members and tags are removed from the
+version. Both path components are URL-safe single segments of 1–128
+characters. A version may contain at most 10,000 narinfo members.
+
+Each version records a `registered_at` timestamp. Re-registering the same
+package/version preserves that timestamp; a new build version creates a new
+timestamp and identity.
+
+## Management console and API
+
+The Worker serves an authenticated console at `/admin` and management endpoints under `/api/admin/*`.
+
+The console can:
+
+- List packages, expand build versions, and inspect each version's files, tags, object counts, byte sizes, and consistency state.
+- Group versions within each package by their complete tag set with an optional, enabled-by-default display toggle; each tag group can be expanded independently.
+- Filter by package name, version name, arbitrary tag values, and lifecycle state.
+- Configure the default retention period.
+- Configure structured retention rules with visual `where`, `group by`, `lastN`,
+  and duration actions. Conditions support package name, package version, all
+  tags, and individual tag values with equals, starts-with, ends-with, contains,
+  and optional negation.
+- Pin and unpin build versions.
+- Immediately delete a build version.
+- Run garbage collection on demand.
+- Inspect unregistered objects and consistency errors.
+
+The console does not expose arbitrary single-object overwrite or destructive
+object editing. Package rows are grouping-only; version deletion is the
+intended administrative deletion unit.
+
+The implemented management endpoints are:
+
+```text
+GET    /api/admin/packages
+GET    /api/admin/packages/{packageName}
+GET    /api/admin/packages/{packageName}/versions/{versionName}
+PATCH  /api/admin/packages/{packageName}/versions/{versionName}
+PUT    /api/admin/packages/{packageName}/versions/{versionName}/pin
+DELETE /api/admin/packages/{packageName}/versions/{versionName}/pin
+DELETE /api/admin/packages/{packageName}/versions/{versionName}
+GET    /api/admin/jobs/{jobId}
+POST   /api/admin/gc
+GET    /api/admin/policies
+POST   /api/admin/policies
+PUT    /api/admin/policies/{policyId}
+DELETE /api/admin/policies/{policyId}
+GET    /api/admin/settings
+PUT    /api/admin/settings
+```
+
+Version deletion returns `202 Accepted` with a persistent job ID. The console
+starts the first batch immediately and exposes the job status while later
+batches run.
+
+## Retention, pinning, and garbage collection
+
+Each build version may carry:
+
+- An optional explicit `retentionDays` value.
+- A `pinned` state.
+- Arbitrary tags.
+- `registered_at` and GC audit metadata.
+
+Policies use the following structured shape:
+
+```json
+{
+  "name": "stable-linux-builds",
+  "conditions": [
+    {"field": "pkg_name", "operator": "starts_with", "value": "hello"},
+    {"field": "pkg_tag:channel", "operator": "equals", "value": "stable"}
+  ],
+  "groupBy": ["pkg_name", "pkg_tag:system"],
+  "lastN": 3,
+  "durationDays": 30
+}
+```
+
+All conditions are ANDed. Supported fields are `pkg_name`, `pkg_version`,
+`pkg_tags`, and `pkg_tag:<tag>`. Supported operators are `equals`,
+`starts_with`, `ends_with`, and `contains`; each condition may be negated.
+`pkg_tags` is evaluated as sorted comma-separated `key=value` pairs, while a
+missing `pkg_tag:<tag>` has the empty-string value.
+
+`groupBy` determines the last-N partition. It can contain any supported field;
+an empty list means one global group. The newest `lastN` matching versions in
+each group are protected, ordered by `registered_at`, never by version-name
+parsing. `durationDays` applies to each matching version that is not otherwise
+protected. A rule may set either action or both.
+
+When rules overlap, keep-latest protection is the union of all matching rules,
+and the finite duration is the largest matching `durationDays`. An explicit
+version `retentionDays` override still wins. Existing policy rows are cleared
+by the structured-rule migration and must be recreated in the new editor.
+
+The default GC retention is 7 days. In addition to structured policies,
+the Worker protects the newest 3 versions for every exact package-name and
+complete-tag combination. A Workers Cron trigger runs GC once per day.
+Objects that are not registered to an active version use the existing six-hour
+HTTP cache TTL.
+
+The default retention can be changed from the management console. Cache-info values (`StoreDir`, `Priority`, and `WantMassQuery`) are also stored in D1 when changed and otherwise use Wrangler defaults.
+
+### Pins and immediate deletion
+
+Pinning protects a version from automatic GC only. An administrator can
+explicitly delete a pinned version through the console after confirmation.
+
+Immediate deletion:
+
+- Deletes the selected version and its membership metadata.
+- Deletes associated narinfo objects only when no other live version references them.
+- Deletes NAR payloads only when no other live narinfo references them.
+- Runs in bounded batches to fit Worker and D1 limits.
+- Records the actor, package/version target, timestamp, and reason in an audit log.
+
+Deleting a version leaves sibling versions and its package grouping intact. A
+future registration of the same package/version can create a fresh active
+version after the delete job completes.
+
+## Metrics and logs
+
+The project does not run a Prometheus server or expose a `/metrics` endpoint. It emits structured Worker log events suitable for Cloudflare Workers Analytics and Logs:
+
+- `cache_hit`
+- `cache_miss`
+- `r2_get`
+- `r2_put`
+- `bytes_served`
+- `upload_bytes`
+- `auth_failure`
+
+Events should include an event name, timestamp, request method, normalized object kind, status, and relevant byte count. Tokens and raw authorization headers must never be logged.
+
+Recommended counting semantics:
+
+- `cache_hit`: successful cache GET or HEAD for an available object.
+- `cache_miss`: cache GET or HEAD returning `404`.
+- `r2_get` and `r2_put`: completed R2 operations.
+- `bytes_served`: bytes sent for successful GET responses, including the selected Range length.
+- `upload_bytes`: bytes accepted for a new object, excluding idempotent duplicate uploads.
+- `auth_failure`: rejected or malformed bearer or netrc/Basic authentication.
+
+## Deployment
+
+The complete first-time deployment guide is in
+[`deployment.md`](deployment.md). The short version is:
+
+```bash
+cp wrangler.jsonc.example wrangler.jsonc
+# Edit wrangler.jsonc and replace every resource placeholder.
+npx wrangler login
+npx wrangler d1 migrations apply <D1_DATABASE_NAME> --remote
+npx wrangler secret put READ_TOKEN
+npx wrangler secret put WRITE_TOKEN
+npx wrangler secret put ADMIN_TOKEN
+npx wrangler deploy
+```
+
+`wrangler.jsonc` is intentionally ignored by Git because it contains
+deployment-specific R2/D1 identifiers, hostname, and public signing-key
+settings. Do not commit it; initialize it from
+[`wrangler.jsonc.example`](../wrangler.jsonc.example) in each checkout. For local
+development secrets, optionally run:
+
+```bash
+cp .dev.vars.example .dev.vars
+```
+
+The default operational variable is `DEFAULT_RETENTION_DAYS=7`. The baseline
+migration seeds an editable `default-package-tags` rule that keeps the newest
+three versions for each exact package-name and complete-tag combination.
+
+Bindings and secrets are infrastructure configuration. The management console can configure retention, matching policies, tags, pins, and package/version metadata after deployment, but cannot replace the R2 bucket, D1 database, or Worker Secrets.
+
+The local test suite uses the Workers Vitest pool with local D1/R2 simulators.
+
+## Acceptance checklist
+
+The v1 implementation is complete when it can demonstrate:
+
+- Real `nix copy --to` and `nix copy --from` operation.
+- GET, HEAD, Range, ETag, and conditional request behavior.
+- The complete anonymous/read/write/admin permission matrix.
+- Idempotent same-content PUT and conflict on different-content PUT.
+- Rejection of narinfo that references a missing NAR.
+- Correct Cache-Control and Content-Length values for every cache path.
+- Idempotent package/version registration with preserved `registered_at`.
+- Package/version/tag field conditions and operator matching.
+- Structured retention rules matching fields and operators, grouping by package,
+  version, all tags, and individual tags, and retaining last N per group.
+- The seeded, editable default rule retaining the newest three versions per exact package-name and complete-tag combination.
+- Pinned versions protected from automatic GC.
+- Explicit, confirmed deletion of pinned versions by an administrator.
+- Shared NAR payloads retained while still referenced.
+- Management-console tokens scoped to the current browser tab and cleared when its page session ends.
+- All documented structured log events emitted with safe fields.
+
+## Development commands
+
+```bash
+npm install
+npm run dev
+npm run typecheck
+npm test
+npm run build
+```
+
+Architecture, operator configuration, and the required change-history process
+are documented in [`architecture.md`](architecture.md),
+[`configuration.md`](configuration.md), and [`deployment.md`](deployment.md).
+The RFC process is documented in [`rfc/README.md`](rfc/README.md).
+
+`npm run build` runs `wrangler deploy --dry-run`; it does not publish a Worker.

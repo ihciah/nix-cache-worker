@@ -1,0 +1,5 @@
+# Local development values only. Replace these placeholders locally.
+# Production deployments must use `wrangler secret put` instead.
+READ_TOKEN=replace-with-local-read-token
+WRITE_TOKEN=replace-with-local-write-token
+ADMIN_TOKEN=replace-with-local-admin-token

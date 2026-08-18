@@ -1,0 +1,87 @@
+# Architecture
+
+## Request path
+
+The Worker routes `/nix-cache-info`, narinfo paths, and `/nar/*` paths through
+Hono. Authentication is applied before mutation routes. Public GET and HEAD
+requests query R2 for object bytes and D1 for metadata-driven headers. PUT
+requests validate the path, enforce immutable semantics, and index the result.
+
+```text
+Nix client
+   |
+   v
+Hono route + auth + request ID
+   |------------------------------|
+   v                              v
+R2 object bytes              D1 object index
+   |                              |
+   +---- dynamic TTL / version membership
+```
+
+## Storage boundaries
+
+R2 is authoritative for object bytes and supports the internal multipart upload
+used for large NARs. D1 is authoritative for searchable metadata and lifecycle
+state: object indexes, narinfo-to-NAR references, packages, versions, tags,
+policies, pins, jobs, and audit records. A D1 row must never be treated as a replacement
+for an R2 object; narinfo acceptance checks both.
+
+## Package/version hierarchy
+
+`artifact_packages` is the first-level grouping entity. Each package contains
+many `artifact_versions`, identified by `(package_name, version_name)`. A
+version owns many narinfo members through `artifact_version_members`; each
+narinfo points to its NAR through `narinfo_refs`.
+
+Version names are opaque and are never parsed. Re-registering a version replaces
+its complete tags and member declaration while preserving its original
+`registered_at` and every immutable cache object.
+
+The version membership query also associates each member's referenced NAR with
+the version. This lets both the narinfo and NAR receive the same effective
+response TTL, while shared NAR payloads remain protected by live references.
+
+## Retention and jobs
+
+Retention is evaluated for each version. A structured rule ANDs conditions on
+package name, version name, all tags, or an individual tag value. Its `lastN`
+count protects the newest matching versions independently in each computed
+`groupBy` tuple. Overlapping rules union their protection, and the largest
+matching finite duration applies unless the version has an explicit override.
+`registered_at` orders versions, not parsed version labels. GC and deletion use
+persistent jobs and bounded batches so a Worker interruption can be retried
+safely.
+
+The default finite retention is seven days. The baseline migration seeds an
+ordinary editable rule that protects the newest three versions in each exact
+`(package_name, complete tags)` group; it can be changed or deleted from the
+admin console.
+
+HTTP TTL is separate from deletion authority. Unclassified objects use six
+hours. Version-associated objects use the longest active-version retention. Pin
+and keep-latest protect automatic GC only and do not change the HTTP TTL.
+
+Full public GET responses use `caches.default` with a D1-backed cache
+generation in the key. Version, rule, setting, and deletion updates advance
+the generation so stale dynamic TTLs or deleted objects are not served from a
+previous Worker cache entry. Range and conditional requests bypass the Worker
+cache and retain the R2-backed protocol path.
+
+## Admin surface
+
+`/admin` is a static HTML console rendered as a single main-column view. After
+successful validation, its token is kept in same-origin `sessionStorage` for
+the current browser tab and sent as an Authorization header. A page reload
+restores and validates the token before showing the console; an invalid token
+is removed. The main view renders package rows, optional tag-group rows, and
+expandable version and read-only file rows. Tag grouping is a client-side
+layout toggle and does not change the package/version API data. `/api/admin/overview`
+distinguishes package/version counts from direct cache-object counts so a valid
+cache with unregistered objects is visible to operators.
+
+## Observability
+
+The Worker emits structured logs for cache hits/misses, R2 reads/writes,
+served/uploaded bytes, and authentication failures. It does not run a
+Prometheus server or expose credentials in logs.
