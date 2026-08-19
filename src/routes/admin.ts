@@ -283,7 +283,11 @@ adminRoutes.patch("/api/admin/packages/:packageName/versions/:versionName", asyn
   const retentionDays = body.retentionDays === undefined ? row.retention_days : validateNonNegativeInteger(body.retentionDays, "retention_days");
   const updateResult = await c.env.DB.prepare("UPDATE artifact_versions SET tags_json = ?, retention_days = ?, updated_at = ? WHERE version_id = ? AND state = 'active'")
     .bind(JSON.stringify(tags), retentionDays, now(), row.version_id).run();
-  if (updateResult.meta.changes !== 1) throw new AppError("version_deleting", "The version is currently being deleted", 409);
+  if (updateResult.meta.changes !== 1) {
+    const current = await getVersion(c.env, packageName, versionName);
+    if (current?.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
+    throw new AppError("version_busy", "The version changed before the update could be applied", 409, { state: current?.state ?? "missing" });
+  }
   await bumpCacheGeneration(c.env);
   await emitAudit(c.env, "version_update", c.get("role"), `${packageName}/${versionName}`, { versionId: row.version_id, tags, retentionDays });
   const updated = await getVersion(c.env, packageName, versionName);
@@ -300,7 +304,11 @@ async function setPin(c: Context<AppEnv>, pinned: boolean): Promise<Response> {
   if (!row || row.state === "deleted") throw new AppError("not_found", "The version was not found", 404);
   if (row.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
   const updated = await c.env.DB.prepare("UPDATE artifact_versions SET pinned = ?, updated_at = ? WHERE version_id = ? AND state = 'active'").bind(pinned ? 1 : 0, now(), row.version_id).run();
-  if (updated.meta.changes !== 1) throw new AppError("version_deleting", "The version is currently being deleted", 409);
+  if (updated.meta.changes !== 1) {
+    const current = await getVersion(c.env, packageName, versionName);
+    if (current?.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
+    throw new AppError("version_busy", "The version changed before the pin state could be updated", 409, { state: current?.state ?? "missing" });
+  }
   await emitAudit(c.env, pinned ? "version_pin" : "version_unpin", c.get("role"), `${packageName}/${versionName}`, { versionId: row.version_id });
   return c.json({ versionId: row.version_id, packageName, versionName, pinned });
 }

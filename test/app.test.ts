@@ -376,16 +376,31 @@ describe("Nix cache HTTP API", () => {
     });
     expect(deletion.response.status).toBe(409);
     expect((await deletion.response.json<{ error: { code: string } }>()).error.code).toBe("version_busy");
+    const patch = await request("/api/admin/packages/registering-delete-package/versions/v1", {
+      method: "PATCH",
+      headers: { ...bearer("admin-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ tags: { channel: "busy" } }),
+    });
+    expect(patch.response.status).toBe(409);
+    expect((await patch.response.json<{ error: { code: string } }>()).error.code).toBe("version_busy");
+    const pin = await request("/api/admin/packages/registering-delete-package/versions/v1/pin", {
+      method: "PUT",
+      headers: bearer("admin-secret"),
+    });
+    expect(pin.response.status).toBe(409);
+    expect((await pin.response.json<{ error: { code: string } }>()).error.code).toBe("version_busy");
   });
 
   it("reclaims stale running jobs", async () => {
     const id = crypto.randomUUID();
     const stale = new Date(Date.now() - 16 * 60_000).toISOString();
     await testEnv.DB.prepare(
-      "INSERT INTO jobs (id, type, status, payload_json, created_at, updated_at) VALUES (?, 'gc', 'running', '{}', ?, ?)",
+      "INSERT INTO jobs (id, type, status, payload_json, created_at, updated_at) VALUES (?, 'gc', 'running', '[\"legacy\"]', ?, ?)",
     ).bind(id, stale, stale).run();
     await runQueuedJobs(testEnv, 2);
     expect((await testEnv.DB.prepare("SELECT status FROM jobs WHERE id = ?").bind(id).first<{ status: string }>())?.status).toBe("completed");
+    const payload = JSON.parse((await testEnv.DB.prepare("SELECT payload_json FROM jobs WHERE id = ?").bind(id).first<{ payload_json: string }>())?.payload_json ?? "{}");
+    expect(payload[0]).toBeUndefined();
   });
 
   it("resumes deletion when objects are already marked deleting", async () => {

@@ -76,6 +76,12 @@ lose the active-state race before acquiring the deletion lock) return the
 distinct `version_busy` conflict instead of reporting that deletion is already
 in progress.
 
+Version metadata and pin mutations use the same state-aware conflict mapping:
+they report `version_deleting` only for a deleting version and `version_busy`
+when a registering or otherwise changed version loses the conditional update
+race. Persistent job payload parsing also rejects JSON arrays and falls back to
+the safe default object shape.
+
 Deletion-job insertion ignores the active-job uniqueness conflict. The caller
 re-reads the existing job after a conflict, so concurrent deletion requests
 remain idempotent instead of surfacing a database constraint error.
@@ -123,6 +129,8 @@ existing status and payload fields.
 - Empty-body retries and membership disappearance during TTL calculation retain
   their safe error and cache-TTL behavior.
 - Deletion requests racing registration return the accurate busy conflict.
+- Metadata and pin mutations report accurate conflicts while a version is
+  registering or changing state.
 - Concurrent deletion-job creation returns the already queued job instead of a
   database constraint error.
 - Write-claim expiry cleanup and TTL evaluation remain bounded on hot read/write
@@ -132,6 +140,7 @@ existing status and payload fields.
 - Whitespace-only narinfo lines are accepted without weakening required-field
   validation.
 - Large GC/deletion work advances through bounded persistent batches.
+- Legacy array-shaped job payloads fall back to the default object payload.
 - Audit and metric events are emitted with the documented safe fields.
 
 ## Implementation notes
