@@ -148,9 +148,18 @@ async function protectedVersionIdsForRows(env: AppEnv["Bindings"], rows: Version
         const target = targets.get(targetKey);
         if (!target) continue;
         const list = latest.get(targetKey) ?? [];
-        list.push({ versionId: candidate.version_id, registeredAt: candidate.registered_at });
-        list.sort((left, right) => right.registeredAt.localeCompare(left.registeredAt) || right.versionId.localeCompare(left.versionId));
-        latest.set(targetKey, list.slice(0, target));
+        const item = { versionId: candidate.version_id, registeredAt: candidate.registered_at };
+        if (list.length < target) {
+          list.push(item);
+          if (list.length === target) list.sort(compareRegisteredVersions);
+        } else {
+          const worst = list[list.length - 1];
+          if (worst && compareRegisteredVersions(item, worst) < 0) {
+            list[list.length - 1] = item;
+            list.sort(compareRegisteredVersions);
+          }
+        }
+        latest.set(targetKey, list);
       }
     }
     if (page.results.length < 200) break;
@@ -172,6 +181,10 @@ function packageItems(versions: VersionRow[], query: string): Map<string, Versio
     groups.set(row.package_name, group);
   }
   return groups;
+}
+
+function compareRegisteredVersions(left: { versionId: string; registeredAt: string }, right: { versionId: string; registeredAt: string }): number {
+  return right.registeredAt.localeCompare(left.registeredAt) || right.versionId.localeCompare(left.versionId);
 }
 
 async function packageResponse(

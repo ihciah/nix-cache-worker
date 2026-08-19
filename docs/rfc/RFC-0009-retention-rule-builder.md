@@ -73,6 +73,10 @@ versions in each group, ordered by `registered_at DESC`. Grouping affects only
 last-N protection; `durationDays` is evaluated independently for every
 matching version.
 
+Protection evaluation keeps only the bounded top-N candidates for each
+rule/group and re-sorts a full candidate list only when a new version can enter
+that top-N set.
+
 ### Matching and retention combination
 
 For each active version, every matching rule contributes independently:
