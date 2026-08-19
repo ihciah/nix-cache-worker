@@ -41,6 +41,11 @@ All application uploads acquire the per-key D1 write claim. Multipart claims
 are renewed while parts are being consumed. A key with a `deleting` D1 object
 row cannot be reused until deletion cleanup has completed.
 
+Deletion retries treat an object row that is already `deleting` as an explicit
+resume state rather than relying on the affected-row count of a no-op UPDATE.
+The retry still evaluates the live-reference guard while holding the object
+claim, then retries the R2 delete so a prior R2 failure cannot strand bytes.
+
 If an R2 object already exists but its digest index is absent or incomplete, a
 retry hashes the existing R2 bytes and repairs the D1 row before deciding
 whether the incoming content is an immutable duplicate or conflict.
@@ -63,6 +68,8 @@ status, object kind, and byte counts where applicable.
 - A deleting version cannot be re-registered, patched, or pinned.
 - A deleting object key cannot be overwritten or reused by an application
   upload.
+- An object left in `deleting` state is independently retryable until its R2
+  bytes and D1 row have been cleaned up.
 - A different-content PUT never replaces an existing R2 object.
 - A transient D1 indexing failure does not make a successfully stored object
   permanently unrecoverable.
@@ -84,6 +91,8 @@ existing status and payload fields.
 - A retry repairs an R2 object whose D1 index is missing or lacks a digest.
 - Deleting and re-uploading the same key cannot cause the old job to delete the
   new object.
+- A deletion retry removes R2 bytes when the D1 object row is already in
+  `deleting` state.
 - Narinfo core-field and dependency validation, strong `If-Match`, and 416
   `Content-Range` behavior are tested.
 - Large GC/deletion work advances through bounded persistent batches.

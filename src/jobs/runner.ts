@@ -176,11 +176,22 @@ async function markAndDeleteObject(env: Bindings, key: string, guard?: { sql: st
   if (!owner) throw new AppError("object_busy", "The object is currently being uploaded or inspected", 409);
   try {
     const predicate = guard ? ` AND (${guard.sql})` : "";
-    const marked = await env.DB.prepare(
-      `UPDATE objects SET state = 'deleting'
-       WHERE r2_key = ? AND state IN ('ready', 'orphaned', 'deleting')${predicate}`,
-    ).bind(key, ...(guard?.bindings ?? [])).run();
-    if (marked.meta.changes !== 1) return false;
+    const existing = await env.DB.prepare("SELECT state FROM objects WHERE r2_key = ?").bind(key).first<{ state: string }>();
+    if (!existing) return false;
+    if (existing.state === "deleting") {
+      // A retry must not depend on whether D1 counts a no-op UPDATE as a change.
+      const permitted = await env.DB.prepare(
+        `SELECT 1 AS present FROM objects
+         WHERE r2_key = ? AND state = 'deleting'${predicate}`,
+      ).bind(key, ...(guard?.bindings ?? [])).first<{ present: number }>();
+      if (!permitted) return false;
+    } else {
+      const marked = await env.DB.prepare(
+        `UPDATE objects SET state = 'deleting'
+         WHERE r2_key = ? AND state IN ('ready', 'orphaned')${predicate}`,
+      ).bind(key, ...(guard?.bindings ?? [])).run();
+      if (marked.meta.changes !== 1) return false;
+    }
     await env.CACHE_BUCKET.delete(key);
     return true;
   } finally {

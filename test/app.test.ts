@@ -337,6 +337,27 @@ describe("Nix cache HTTP API", () => {
     expect((await testEnv.DB.prepare("SELECT status FROM jobs WHERE id = ?").bind(id).first<{ status: string }>())?.status).toBe("completed");
   });
 
+  it("resumes deletion when objects are already marked deleting", async () => {
+    const pair = await uploadPair("deleting-retry");
+    const registration = await register("deleting-retry-package", "v1", [pair.narinfoKey]);
+    expect(registration.response.status).toBe(201);
+    const version = await testEnv.DB.prepare(
+      "SELECT version_id FROM artifact_versions WHERE package_name = ? AND version_name = ?",
+    ).bind("deleting-retry-package", "v1").first<{ version_id: string }>();
+    expect(version?.version_id).toBeTruthy();
+    await testEnv.DB.batch([
+      testEnv.DB.prepare("UPDATE artifact_versions SET state = 'deleting' WHERE version_id = ?").bind(version?.version_id),
+      testEnv.DB.prepare("UPDATE objects SET state = 'deleting' WHERE r2_key IN (?, ?)").bind(pair.narinfoKey, pair.narKey),
+      testEnv.DB.prepare(
+        "INSERT INTO jobs (id, type, status, target_version_id, payload_json, created_at, updated_at) VALUES (?, 'delete_version', 'queued', ?, '{}', ?, ?)",
+      ).bind(crypto.randomUUID(), version?.version_id, new Date().toISOString(), new Date().toISOString()),
+    ]);
+    await runQueuedJobs(testEnv, 2);
+    expect((await request(`/${pair.narinfoKey}`)).response.status).toBe(404);
+    expect((await request(`/${pair.narKey}`)).response.status).toBe(404);
+    expect((await request("/api/admin/packages/deleting-retry-package/versions/v1", { headers: bearer("admin-secret") })).response.status).toBe(404);
+  });
+
   it("preserves shared NARs while another version references them", async () => {
     const sharedNarKey = "nar/shared-version.nar";
     const sharedNar = await request(`/${sharedNarKey}`, { method: "PUT", headers: bearer("write-secret"), body: "shared-body" });
