@@ -38,14 +38,17 @@ function strongEtagMatches(header: string | null, etag: string): boolean {
 export async function claimObjectWrite(env: Bindings, key: string): Promise<string | null> {
   const owner = crypto.randomUUID();
   const currentTime = Date.now();
+  const currentTimestamp = new Date(currentTime).toISOString();
   const expiresAt = new Date(currentTime + WRITE_CLAIM_TTL_MS).toISOString();
   if (currentTime - lastWriteClaimCleanupAt >= WRITE_CLAIM_CLEANUP_INTERVAL_MS) {
     lastWriteClaimCleanupAt = currentTime;
-    await env.DB.prepare("DELETE FROM write_claims WHERE expires_at < ?").bind(new Date(currentTime).toISOString()).run();
+    await env.DB.prepare("DELETE FROM write_claims WHERE expires_at < ?").bind(currentTimestamp).run();
   }
   const result = await env.DB.prepare(
-    "INSERT OR IGNORE INTO write_claims (r2_key, owner, expires_at) VALUES (?, ?, ?)",
-  ).bind(key, owner, expiresAt).run();
+    `INSERT INTO write_claims (r2_key, owner, expires_at) VALUES (?, ?, ?)
+     ON CONFLICT(r2_key) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at
+     WHERE write_claims.expires_at < ?`,
+  ).bind(key, owner, expiresAt, currentTimestamp).run();
   return result.meta.changes === 1 ? owner : null;
 }
 

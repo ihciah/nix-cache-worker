@@ -89,9 +89,11 @@ remain idempotent instead of surfacing a database constraint error.
 
 The write-claim expiry cleanup is indexed by `expires_at` and rate-limited per
 Worker isolate so hot upload and deletion loops do not issue a cleanup query
-for every claim. TTL evaluation computes retention during its bounded
-membership scan and uses a separate existence check only to detect membership
-disappearing before the response is formed.
+for every claim. A claim insert also atomically replaces an expired row for its
+requested key, so cleanup amortization cannot extend that key's lock lifetime.
+TTL evaluation computes retention during its bounded membership scan and uses a
+separate existence check only to detect membership disappearing before the
+response is formed.
 
 ## Invariants and security
 
@@ -137,6 +139,8 @@ existing status and payload fields.
   database constraint error.
 - Write-claim expiry cleanup is amortized and TTL evaluation remains bounded on
   hot read/write paths.
+- An expired claim is immediately reclaimable for the key being requested.
+- Package search preserves SQL matches for raw tag JSON formatting.
 - Narinfo core-field and dependency validation, strong `If-Match`, and 416
   `Content-Range` behavior are tested.
 - Range HEAD responses preserve cache-hit observability.

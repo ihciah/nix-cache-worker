@@ -214,6 +214,28 @@ describe("Nix cache HTTP API", () => {
     expect(conflict.response.status).toBe(409);
   });
 
+  it("reclaims an expired write claim for the requested key", async () => {
+    const seedOwner = await claimObjectWrite(testEnv, "claim-cleanup-seed");
+    expect(seedOwner).toBeTruthy();
+    await releaseObjectWrite(testEnv, "claim-cleanup-seed", seedOwner as string);
+    await testEnv.DB.prepare("INSERT OR REPLACE INTO write_claims (r2_key, owner, expires_at) VALUES (?, ?, ?)")
+      .bind("expired-claim", "stale-owner", "2000-01-01T00:00:00.000Z").run();
+    const owner = await claimObjectWrite(testEnv, "expired-claim");
+    expect(owner).toBeTruthy();
+    await releaseObjectWrite(testEnv, "expired-claim", owner as string);
+  });
+
+  it("keeps SQL tag formatting matches visible in package search", async () => {
+    const timestamp = new Date().toISOString();
+    await testEnv.DB.prepare(
+      "INSERT INTO artifact_versions (version_id, package_name, version_name, tags_json, registered_at, updated_at, state) VALUES (?, ?, ?, ?, ?, ?, 'active')",
+    ).bind(crypto.randomUUID(), "formatted-search-package", "v1", '{"channel": "stable"}', timestamp, timestamp).run();
+    const result = await request("/api/admin/packages?q=%22channel%22%3A%20%22stable%22", { headers: bearer("admin-secret") });
+    expect(result.response.status).toBe(200);
+    const body = await result.response.json<{ items: Array<{ packageName: string; versionCount: number }> }>();
+    expect(body.items.find((item) => item.packageName === "formatted-search-package")?.versionCount).toBe(1);
+  });
+
   it("repairs a missing D1 object index on an idempotent retry", async () => {
     const key = "nar/retry-index-repair.nar";
     const first = await request(`/${key}`, { method: "PUT", headers: bearer("write-secret"), body: "repair-me" });

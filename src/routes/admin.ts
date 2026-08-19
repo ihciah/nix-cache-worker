@@ -164,7 +164,7 @@ function packageItems(versions: VersionRow[], query: string): Map<string, Versio
   const groups = new Map<string, VersionRow[]>();
   for (const row of versions) {
     const tags = parseTags(row.tags_json);
-    const haystack = `${row.package_name} ${row.version_name} ${JSON.stringify(tags)}`.toLowerCase();
+    const haystack = `${row.package_name} ${row.version_name} ${row.tags_json} ${JSON.stringify(tags)}`.toLowerCase();
     if (query && !haystack.includes(query)) continue;
     const group = groups.get(row.package_name) ?? [];
     group.push(row);
