@@ -42,6 +42,7 @@ beforeAll(async () => {
     CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE jobs (id TEXT PRIMARY KEY, type TEXT NOT NULL, status TEXT NOT NULL, target_version_id TEXT, cursor INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL DEFAULT '{}', last_error TEXT, created_by TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE write_claims (r2_key TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at TEXT NOT NULL);
+    CREATE INDEX idx_write_claims_expires_at ON write_claims(expires_at);
     CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, actor TEXT NOT NULL, target TEXT, details_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
     CREATE TABLE gc_scan_versions (job_id TEXT NOT NULL, version_id TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(job_id, version_id));
     CREATE TABLE gc_policy_matches (job_id TEXT NOT NULL, version_id TEXT NOT NULL, policy_id INTEGER NOT NULL, group_key TEXT NOT NULL, registered_at TEXT NOT NULL, keep_count INTEGER NOT NULL, PRIMARY KEY(job_id, version_id, policy_id));

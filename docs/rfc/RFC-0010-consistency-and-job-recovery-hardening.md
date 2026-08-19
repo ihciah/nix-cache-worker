@@ -74,6 +74,11 @@ lose the active-state race before acquiring the deletion lock) return the
 distinct `version_busy` conflict instead of reporting that deletion is already
 in progress.
 
+The write-claim expiry cleanup is indexed by `expires_at` so the per-upload
+claim path does not scan the complete claims table. TTL evaluation computes
+retention during its bounded membership scan and uses a separate existence
+check only to detect membership disappearing before the response is formed.
+
 ## Invariants and security
 
 - A deleting version cannot be re-registered, patched, or pinned.
@@ -111,6 +116,8 @@ existing status and payload fields.
 - Empty-body retries and membership disappearance during TTL calculation retain
   their safe error and cache-TTL behavior.
 - Deletion requests racing registration return the accurate busy conflict.
+- Write-claim expiry cleanup and TTL evaluation remain bounded on hot read/write
+  paths.
 - Narinfo core-field and dependency validation, strong `If-Match`, and 416
   `Content-Range` behavior are tested.
 - Large GC/deletion work advances through bounded persistent batches.

@@ -1,4 +1,7 @@
 -- Persistent scan and cleanup state for bounded, resumable background work.
+CREATE INDEX IF NOT EXISTS idx_write_claims_expires_at
+  ON write_claims(expires_at);
+
 CREATE TABLE IF NOT EXISTS gc_scan_versions (
   job_id TEXT NOT NULL,
   version_id TEXT NOT NULL,
