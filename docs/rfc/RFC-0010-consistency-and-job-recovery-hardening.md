@@ -58,7 +58,8 @@ follow-up batches rather than loading a complete version into memory.
 Narinfo parsing validates the core fields required for usable Nix metadata and
 continues to require the referenced NAR to be present and indexed. `If-Match`
 uses strong ETag comparison; invalid ranges return the standard unsatisfied
-range header.
+range header. Whitespace-only narinfo lines are ignored, and successful parsing
+returns a non-null validated `StorePath`.
 
 Audit writes are awaited by mutation handlers and jobs. Cache generation is
 advanced before deletion starts, and structured cache/R2 events include method,
@@ -128,6 +129,8 @@ existing status and payload fields.
   paths.
 - Narinfo core-field and dependency validation, strong `If-Match`, and 416
   `Content-Range` behavior are tested.
+- Whitespace-only narinfo lines are accepted without weakening required-field
+  validation.
 - Large GC/deletion work advances through bounded persistent batches.
 - Audit and metric events are emitted with the documented safe fields.
 

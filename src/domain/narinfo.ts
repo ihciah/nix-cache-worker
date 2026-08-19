@@ -3,12 +3,13 @@ import { kindForKey } from "./keys";
 
 export type ParsedNarInfo = {
   narKey: string;
-  storePath: string | null;
+  storePath: string;
 };
 
 export function parseNarInfo(text: string): ParsedNarInfo {
   const fields = new Map<string, string>();
-  for (const line of text.split(/\r?\n/)) {
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
     if (!line) continue;
     const separator = line.indexOf(":");
     if (separator <= 0) throw new AppError("invalid_narinfo", "The narinfo contains a malformed field", 422);
@@ -36,8 +37,8 @@ export function parseNarInfo(text: string): ParsedNarInfo {
   } catch {
     throw new AppError("invalid_narinfo", "The narinfo URL must reference a /nar/ object", 422);
   }
-  const storePath = fields.get("StorePath") ?? "";
-  if (!storePath.startsWith("/nix/store/") || !/^\d+$/.test(fields.get("FileSize") ?? "") || !/^\d+$/.test(fields.get("NarSize") ?? "")) {
+  const storePath = fields.get("StorePath");
+  if (!storePath || !storePath.startsWith("/nix/store/") || !/^\d+$/.test(fields.get("FileSize") ?? "") || !/^\d+$/.test(fields.get("NarSize") ?? "")) {
     throw new AppError("invalid_narinfo", "The narinfo contains invalid store or size fields", 422);
   }
   if (!fields.get("Compression") || !fields.get("FileHash") || !fields.get("NarHash")) {

@@ -251,6 +251,16 @@ describe("Nix cache HTTP API", () => {
     expect(response.response.status).toBe(422);
   });
 
+  it("accepts whitespace-only blank lines in narinfo metadata", async () => {
+    await request("/nar/whitespace-narinfo.nar", { method: "PUT", headers: bearer("write-secret"), body: "payload" });
+    const response = await request("/whitespace-narinfo.narinfo", {
+      method: "PUT",
+      headers: bearer("write-secret"),
+      body: `${narInfoBody("nar/whitespace-narinfo.nar", "/nix/store/whitespace-narinfo")}  \n\t\n`,
+    });
+    expect(response.response.status).toBe(201);
+  });
+
   it("accepts Nix netrc Basic credentials for uploads", async () => {
     const upload = await request("/nar/netrc-version.nar", { method: "PUT", headers: netrcBasic("write-secret"), body: "netrc" });
     expect(upload.response.status).toBe(201);
