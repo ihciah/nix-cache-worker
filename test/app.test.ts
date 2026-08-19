@@ -201,6 +201,8 @@ describe("Nix cache HTTP API", () => {
     expect(first.response.status).toBe(201);
     const duplicate = await request("/nar/immutable-version.nar", { method: "PUT", headers: bearer("write-secret"), body: "first" });
     expect(duplicate.response.status).toBe(204);
+    const empty = await request("/nar/immutable-version.nar", { method: "PUT", headers: bearer("write-secret") });
+    expect(empty.response.status).toBe(400);
     const conflict = await request("/nar/immutable-version.nar", { method: "PUT", headers: bearer("write-secret"), body: "second" });
     expect(conflict.response.status).toBe(409);
   });

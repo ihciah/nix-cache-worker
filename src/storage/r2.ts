@@ -95,6 +95,7 @@ async function duplicateDecision(env: Bindings, key: string, kind: ObjectKind, r
   if (etagMatches(request.headers.get("If-None-Match"), existing.httpEtag)) {
     throw new AppError("precondition_failed", "The object already exists", 412);
   }
+  if (!request.body) throw new AppError("empty_body", "PUT requests must contain a body", 400);
   const incoming = await hashStream(request.body);
   return duplicateDecisionByDigest(env, key, kind, incoming, existing, indexed);
 }

@@ -63,6 +63,12 @@ Audit writes are awaited by mutation handlers and jobs. Cache generation is
 advanced before deletion starts, and structured cache/R2 events include method,
 status, object kind, and byte counts where applicable.
 
+TTL calculation treats a second-pass membership scan that finds no active
+versions as unclassified, avoiding a long fallback retention TTL when a
+membership disappears between the bounded scans. Existing-object PUTs also
+reject a missing request body before hashing so malformed retries receive the
+same `empty_body` response as first-time uploads.
+
 ## Invariants and security
 
 - A deleting version cannot be re-registered, patched, or pinned.
@@ -73,6 +79,10 @@ status, object kind, and byte counts where applicable.
 - A different-content PUT never replaces an existing R2 object.
 - A transient D1 indexing failure does not make a successfully stored object
   permanently unrecoverable.
+- An object with no active membership after TTL evaluation receives the
+  unclassified short TTL.
+- A PUT without a body is rejected consistently whether or not the object key
+  already exists.
 - No token or authorization header is included in logs or audit details.
 
 ## Compatibility and migration
@@ -93,6 +103,8 @@ existing status and payload fields.
   new object.
 - A deletion retry removes R2 bytes when the D1 object row is already in
   `deleting` state.
+- Empty-body retries and membership disappearance during TTL calculation retain
+  their safe error and cache-TTL behavior.
 - Narinfo core-field and dependency validation, strong `If-Match`, and 416
   `Content-Range` behavior are tested.
 - Large GC/deletion work advances through bounded persistent batches.

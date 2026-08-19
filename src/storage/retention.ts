@@ -73,5 +73,6 @@ export async function cacheControlForObject(env: Bindings, key: string, kind: Ob
     if (memberships.results.length < 200) break;
     lastVersionId = memberships.results[memberships.results.length - 1].version_id;
   }
+  if (maxRetentionDays === null) return ttlCacheControl(kind, UNCLASSIFIED_TTL_SECONDS);
   return ttlCacheControl(kind, (maxRetentionDays ?? fallbackDays) * 24 * 60 * 60);
 }

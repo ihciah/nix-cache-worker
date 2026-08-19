@@ -123,13 +123,13 @@ async function versionSummary(
 }
 
 async function protectedVersionIdsForRows(env: AppEnv["Bindings"], rows: VersionRow[], policies: PolicyRow[]): Promise<Set<string>> {
-  const targets = new Map<string, { versionId: string; count: number }>();
+  const targets = new Map<string, number>();
   for (const row of rows) {
     for (const policy of matchingPolicies(row, policies)) {
       const fields = policyGroupBy(policy);
       const count = policy.last_n ?? 0;
       if (!fields || count <= 0) continue;
-      targets.set(`${policy.id}:${groupKey(row, fields)}`, { versionId: row.version_id, count });
+      targets.set(`${policy.id}:${groupKey(row, fields)}`, count);
     }
   }
   if (!targets.size) return new Set();
@@ -149,7 +149,7 @@ async function protectedVersionIdsForRows(env: AppEnv["Bindings"], rows: Version
         const list = latest.get(targetKey) ?? [];
         list.push({ versionId: candidate.version_id, registeredAt: candidate.registered_at });
         list.sort((left, right) => right.registeredAt.localeCompare(left.registeredAt) || right.versionId.localeCompare(left.versionId));
-        latest.set(targetKey, list.slice(0, target.count));
+        latest.set(targetKey, list.slice(0, target));
       }
     }
     if (page.results.length < 200) break;
