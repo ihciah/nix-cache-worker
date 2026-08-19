@@ -73,7 +73,11 @@ The Worker returns the standard cache information document, including the config
 
 ### NARINFO consistency
 
-When a `.narinfo` is uploaded, the Worker parses the referenced NAR URL and verifies that the NAR object already exists in R2 and in the D1 object index. The narinfo is rejected when the referenced NAR is missing.
+When a `.narinfo` is uploaded, the Worker validates the core Nix metadata fields,
+parses the referenced NAR URL, and verifies that the NAR object already exists in
+R2 and in the D1 object index. The narinfo is rejected when the metadata is
+malformed or the referenced NAR is missing. The dependency key is held through
+the index update so a deletion cannot race the consistency check.
 
 The supported upload order is therefore:
 
@@ -279,6 +283,8 @@ explicitly delete a pinned version through the console after confirmation.
 
 Immediate deletion:
 
+- Locks the target version as `deleting` before returning the job ID, so a
+  concurrent registration, metadata update, or pin operation cannot race it.
 - Deletes the selected version and its membership metadata.
 - Deletes associated narinfo objects only when no other live version references them.
 - Deletes NAR payloads only when no other live narinfo references them.
@@ -301,7 +307,9 @@ The project does not run a Prometheus server or expose a `/metrics` endpoint. It
 - `upload_bytes`
 - `auth_failure`
 
-Events should include an event name, timestamp, request method, normalized object kind, status, and relevant byte count. Tokens and raw authorization headers must never be logged.
+Events include an event name, timestamp, request method, normalized object kind,
+status, and relevant byte count. Tokens and raw authorization headers must never
+be logged.
 
 Recommended counting semantics:
 

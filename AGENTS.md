@@ -23,10 +23,10 @@ The project is a storage target for CI-driven package publishing. CI builds pack
 
 - Use `Authorization: Bearer <token>` for authenticated API requests. Also support Nix netrc-generated HTTP Basic credentials where the password matches the Worker Secret; document this as an HTTPS-only compatibility form.
 - Keep `READ_TOKEN`, `WRITE_TOKEN`, and `ADMIN_TOKEN` in Worker Secrets.
-- Never put token values in source code, D1, URLs, cookies, browser persistent storage, test snapshots, or logs.
+- Never put token values in source code, D1, URLs, cookies, test snapshots, or logs.
 - Never log raw `Authorization` headers.
 - Anonymous cache reads are intentional; cache writes and management operations require the appropriate token.
-- The management console may hold an admin token only in the current in-memory page session.
+- The management console may hold a validated admin token in same-origin `sessionStorage` for the current browser tab. It must never use `localStorage`, cookies, or cross-tab/server persistence.
 - Do not add a Cloudflare API credential merely to let the application rewrite its own Worker bindings or Secrets.
 
 ## Cache compatibility

@@ -2,7 +2,8 @@ import { Hono } from "hono";
 import type { AppEnv } from "../env";
 import { AppError } from "../domain/errors";
 import { emitAudit } from "../observability";
-import { bumpCacheGeneration, getObject, getVersion, now, parseTags, type VersionRow } from "../storage/db";
+import { bumpCacheGeneration, getVersion, now, parseTags, type VersionRow } from "../storage/db";
+import { claimObjectWrite, releaseObjectWrite } from "../storage/r2";
 import { requireRole } from "../middleware/auth";
 
 export const versionRoutes = new Hono<AppEnv>();
@@ -41,6 +42,7 @@ export function validateTags(value: unknown): Record<string, string> {
 export function validateNonNegativeInteger(value: unknown, field: string): number | null {
   if (value === undefined || value === null) return null;
   if (!Number.isSafeInteger(value) || Number(value) < 0) throw new AppError(`invalid_${field}`, `${field} must be a non-negative integer`, 422);
+  if (field === "retention_days" && Number(value) > 36_500) throw new AppError(`invalid_${field}`, `${field} must not exceed 36500 days`, 422);
   return Number(value);
 }
 
@@ -51,9 +53,24 @@ async function assertMembers(env: AppEnv["Bindings"], values: unknown): Promise<
   const keys = [...new Set(values as string[])];
   for (const key of keys) {
     if (!/^[A-Za-z0-9._~-]+\.narinfo$/.test(key)) throw new AppError("invalid_members", `Invalid narinfo key: ${key}`, 422);
-    const object = await getObject(env, key);
-    const ref = await env.DB.prepare("SELECT narinfo_key FROM narinfo_refs WHERE narinfo_key = ?").bind(key).first();
-    if (!object || object.state !== "ready" || !ref) throw new AppError("missing_narinfo", `The narinfo is not indexed: ${key}`, 424);
+  }
+  const ready = new Set<string>();
+  for (let offset = 0; offset < keys.length; offset += 100) {
+    const chunk = keys.slice(offset, offset + 100);
+    const placeholders = chunk.map(() => "?").join(",");
+    const result = await env.DB.prepare(
+      `SELECT ni.r2_key AS narinfo_key
+       FROM objects ni
+       JOIN narinfo_refs r ON r.narinfo_key = ni.r2_key
+       JOIN objects n ON n.r2_key = r.nar_key
+       WHERE ni.r2_key IN (${placeholders})
+         AND ni.kind = 'narinfo' AND ni.state = 'ready'
+         AND n.kind = 'nar' AND n.state = 'ready'`,
+    ).bind(...chunk).all<{ narinfo_key: string }>();
+    for (const row of result.results) ready.add(row.narinfo_key);
+  }
+  for (const key of keys) {
+    if (!ready.has(key)) throw new AppError("missing_narinfo", `The narinfo is not indexed: ${key}`, 424);
   }
   return keys;
 }
@@ -79,34 +96,61 @@ versionRoutes.put("/api/packages/:packageName/versions/:versionName", requireRol
   const members = await assertMembers(c.env, body.narinfoKeys);
   const tags = validateTags(body.tags);
   const retentionDays = validateNonNegativeInteger(body.retentionDays, "retention_days");
-  const timestamp = now();
-  const existing = await getVersion(c.env, packageName, versionName);
-  if (existing?.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
-  const versionId = existing?.version_id ?? crypto.randomUUID();
-  const registeredAt = existing?.registered_at ?? timestamp;
+  const versionLockKey = `version-lock/${packageName}/${versionName}`;
+  const versionOwner = await claimObjectWrite(c.env, versionLockKey);
+  if (!versionOwner) throw new AppError("version_update_in_progress", "Another registration for this version is in progress", 409);
+  try {
+    const timestamp = now();
+    const existing = await getVersion(c.env, packageName, versionName);
+    if (existing?.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
+    const requestedVersionId = existing?.version_id ?? crypto.randomUUID();
+    const registeredAt = existing?.registered_at ?? timestamp;
 
-  await c.env.DB.prepare(
-    `INSERT INTO artifact_packages (package_name, created_at, updated_at) VALUES (?, ?, ?)
-     ON CONFLICT(package_name) DO UPDATE SET updated_at = excluded.updated_at`,
-  ).bind(packageName, timestamp, timestamp).run();
-  await c.env.DB.prepare(
-    `INSERT INTO artifact_versions (version_id, package_name, version_name, tags_json, retention_days, pinned, registered_at, updated_at, state)
-     VALUES (?, ?, ?, ?, ?, COALESCE((SELECT pinned FROM artifact_versions WHERE version_id = ?), 0), ?, ?, 'registering')
-     ON CONFLICT(package_name, version_name) DO UPDATE SET tags_json = excluded.tags_json,
-       retention_days = excluded.retention_days, updated_at = excluded.updated_at,
-       state = 'registering'`,
-  ).bind(versionId, packageName, versionName, JSON.stringify(tags), retentionDays, versionId, registeredAt, timestamp).run();
+    await c.env.DB.prepare(
+      `INSERT INTO artifact_packages (package_name, created_at, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(package_name) DO UPDATE SET updated_at = excluded.updated_at`,
+    ).bind(packageName, timestamp, timestamp).run();
+    const lockResult = await c.env.DB.prepare(
+      `INSERT INTO artifact_versions (version_id, package_name, version_name, tags_json, retention_days, pinned, registered_at, updated_at, state)
+       VALUES (?, ?, ?, ?, ?, COALESCE((SELECT pinned FROM artifact_versions WHERE version_id = ?), 0), ?, ?, 'registering')
+       ON CONFLICT(package_name, version_name) DO UPDATE SET tags_json = excluded.tags_json,
+         retention_days = excluded.retention_days, updated_at = excluded.updated_at,
+         state = 'registering'
+       WHERE artifact_versions.state != 'deleting'`,
+    ).bind(requestedVersionId, packageName, versionName, JSON.stringify(tags), retentionDays, requestedVersionId, registeredAt, timestamp).run();
+    if (lockResult.meta.changes !== 1) throw new AppError("version_deleting", "The version is currently being deleted", 409);
+    const locked = await getVersion(c.env, packageName, versionName);
+    if (!locked || locked.state !== "registering") throw new AppError("version_deleting", "The version is currently being deleted", 409);
+    const versionId = locked.version_id;
 
-  await c.env.DB.prepare("DELETE FROM artifact_version_members WHERE version_id = ?").bind(versionId).run();
-  for (let offset = 0; offset < members.length; offset += 100) {
-    const statements = members.slice(offset, offset + 100).map((key) => c.env.DB.prepare(
-      "INSERT INTO artifact_version_members (version_id, narinfo_key) VALUES (?, ?)",
-    ).bind(versionId, key));
-    await c.env.DB.batch(statements);
+    await c.env.DB.prepare("DELETE FROM artifact_version_members WHERE version_id = ?").bind(versionId).run();
+    for (let offset = 0; offset < members.length; offset += 100) {
+      const statements = members.slice(offset, offset + 100).map((key) => c.env.DB.prepare(
+        `INSERT INTO artifact_version_members (version_id, narinfo_key)
+         SELECT ?, ?
+         WHERE EXISTS (
+           SELECT 1
+           FROM objects ni
+           JOIN narinfo_refs r ON r.narinfo_key = ni.r2_key
+           JOIN objects n ON n.r2_key = r.nar_key
+           WHERE ni.r2_key = ? AND ni.kind = 'narinfo' AND ni.state = 'ready'
+             AND n.kind = 'nar' AND n.state = 'ready'
+         )`,
+      ).bind(versionId, key, key));
+      await c.env.DB.batch(statements);
+    }
+    const memberCount = await c.env.DB.prepare("SELECT COUNT(*) AS count FROM artifact_version_members WHERE version_id = ?")
+      .bind(versionId).first<{ count: number }>();
+    if (Number(memberCount?.count ?? 0) !== members.length) {
+      throw new AppError("missing_narinfo", "One or more narinfo dependencies changed while registering the version", 424);
+    }
+    const activated = await c.env.DB.prepare("UPDATE artifact_versions SET state = 'active', updated_at = ? WHERE version_id = ? AND state = 'registering'")
+      .bind(timestamp, versionId).run();
+    if (activated.meta.changes !== 1) throw new AppError("version_deleting", "The version is currently being deleted", 409);
+    await bumpCacheGeneration(c.env);
+    await emitAudit(c.env, existing ? "version_update" : "version_create", c.get("role"), `${packageName}/${versionName}`, { versionId, members: members.length, tags });
+    return c.json({ versionId, packageName, versionName, tags, narinfoKeys: members, retentionDays, pinned: Boolean(locked.pinned), registeredAt: locked.registered_at }, existing ? 200 : 201);
+  } finally {
+    await releaseObjectWrite(c.env, versionLockKey, versionOwner);
   }
-  await c.env.DB.prepare("UPDATE artifact_versions SET state = 'active', updated_at = ? WHERE version_id = ?")
-    .bind(timestamp, versionId).run();
-  await bumpCacheGeneration(c.env);
-  emitAudit(c.env, existing ? "version_update" : "version_create", c.get("role"), `${packageName}/${versionName}`, { versionId, members: members.length, tags });
-  return c.json({ versionId, packageName, versionName, tags, narinfoKeys: members, retentionDays, pinned: Boolean(existing?.pinned), registeredAt }, existing ? 200 : 201);
 });

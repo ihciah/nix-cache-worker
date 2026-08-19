@@ -21,7 +21,7 @@ app.use("*", authMiddleware);
 
 app.onError((error, c) => {
   const requestId = c.get("requestId") ?? "unknown";
-  if (error instanceof AuthError) emitMetric("auth_failure", { requestId, code: error.code, status: error.status });
+  if (error instanceof AuthError) emitMetric("auth_failure", { requestId, method: c.req.method, code: error.code, status: error.status, bytes: 0 });
   const status = isAppError(error) ? error.status : error instanceof AuthError ? error.status : 500;
   const code = isAppError(error) || error instanceof AuthError ? error.code : "internal_error";
   const message = isAppError(error) || error instanceof AuthError ? error.message : "Internal server error";

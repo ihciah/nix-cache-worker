@@ -55,8 +55,9 @@ export function emitWorkerCacheHit(key: string, kind: string, request: Request, 
     key,
     kind,
     method: request.method,
+    status: response.status,
     source: "worker_cache",
     bytes,
   });
-  if (request.method === "GET") emitMetric("bytes_served", { key, bytes, source: "worker_cache" });
+  if (request.method === "GET") emitMetric("bytes_served", { key, kind, method: "GET", status: response.status, bytes, source: "worker_cache" });
 }

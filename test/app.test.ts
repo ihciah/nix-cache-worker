@@ -26,6 +26,10 @@ beforeAll(async () => {
     DROP TABLE IF EXISTS gc_policies;
     DROP TABLE IF EXISTS settings;
     DROP TABLE IF EXISTS jobs;
+    DROP TABLE IF EXISTS gc_policy_matches;
+    DROP TABLE IF EXISTS gc_scan_versions;
+    DROP TABLE IF EXISTS delete_job_nars;
+    DROP TABLE IF EXISTS delete_job_narinfos;
     DROP TABLE IF EXISTS write_claims;
     DROP TABLE IF EXISTS audit_log;
     PRAGMA foreign_keys = ON;
@@ -39,6 +43,11 @@ beforeAll(async () => {
     CREATE TABLE jobs (id TEXT PRIMARY KEY, type TEXT NOT NULL, status TEXT NOT NULL, target_version_id TEXT, cursor INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL DEFAULT '{}', last_error TEXT, created_by TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE write_claims (r2_key TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at TEXT NOT NULL);
     CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, actor TEXT NOT NULL, target TEXT, details_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
+    CREATE TABLE gc_scan_versions (job_id TEXT NOT NULL, version_id TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(job_id, version_id));
+    CREATE TABLE gc_policy_matches (job_id TEXT NOT NULL, version_id TEXT NOT NULL, policy_id INTEGER NOT NULL, group_key TEXT NOT NULL, registered_at TEXT NOT NULL, keep_count INTEGER NOT NULL, PRIMARY KEY(job_id, version_id, policy_id));
+    CREATE TABLE delete_job_nars (job_id TEXT NOT NULL, nar_key TEXT NOT NULL, PRIMARY KEY(job_id, nar_key));
+    CREATE TABLE delete_job_narinfos (job_id TEXT NOT NULL, narinfo_key TEXT NOT NULL, PRIMARY KEY(job_id, narinfo_key));
+    CREATE UNIQUE INDEX idx_jobs_active_delete_target ON jobs(target_version_id) WHERE type = 'delete_version' AND target_version_id IS NOT NULL AND status IN ('queued', 'running', 'failed');
   `);
   await testEnv.DB.prepare(
     "INSERT INTO gc_policies (name, conditions_json, group_by_json, last_n, duration_days, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -60,6 +69,10 @@ function netrcBasic(token: string): HeadersInit {
   return { Authorization: `Basic ${btoa(`nix:${token}`)}` };
 }
 
+function narInfoBody(narKey: string, storePath: string): string {
+  return `StorePath: ${storePath}\nURL: /${narKey}\nCompression: none\nFileHash: sha256:0000000000000000000000000000000000000000000000000000\nFileSize: 1\nNarHash: sha256:1111111111111111111111111111111111111111111111111111\nNarSize: 1\nReferences: \n`;
+}
+
 async function uploadPair(prefix: string, narBody = prefix): Promise<{ narKey: string; narinfoKey: string }> {
   const narKey = `nar/${prefix}.nar`;
   const narinfoKey = `${prefix}.narinfo`;
@@ -68,7 +81,7 @@ async function uploadPair(prefix: string, narBody = prefix): Promise<{ narKey: s
   const narinfo = await request(`/${narinfoKey}`, {
     method: "PUT",
     headers: bearer("write-secret"),
-    body: `URL: /${narKey}\nStorePath: /nix/store/${prefix}\n`,
+    body: narInfoBody(narKey, `/nix/store/${prefix}`),
   });
   expect([201, 204]).toContain(narinfo.response.status);
   return { narKey, narinfoKey };
@@ -192,6 +205,43 @@ describe("Nix cache HTTP API", () => {
     expect(conflict.response.status).toBe(409);
   });
 
+  it("repairs a missing D1 object index on an idempotent retry", async () => {
+    const key = "nar/retry-index-repair.nar";
+    const first = await request(`/${key}`, { method: "PUT", headers: bearer("write-secret"), body: "repair-me" });
+    expect(first.response.status).toBe(201);
+    await testEnv.DB.prepare("DELETE FROM objects WHERE r2_key = ?").bind(key).run();
+    const retry = await request(`/${key}`, { method: "PUT", headers: bearer("write-secret"), body: "repair-me" });
+    expect(retry.response.status).toBe(204);
+    expect((await testEnv.DB.prepare("SELECT sha256 FROM objects WHERE r2_key = ?").bind(key).first<{ sha256: string }>())?.sha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("completes and replays an internal multipart upload", async () => {
+    const body = new Uint8Array(8 * 1024 * 1024 + 1);
+    body.fill(7);
+    const headers = { ...bearer("write-secret"), "Content-Length": String(body.byteLength) };
+    const first = await request("/nar/multipart-retry.nar", { method: "PUT", headers, body });
+    expect(first.response.status).toBe(201);
+    const replay = await request("/nar/multipart-retry.nar", { method: "PUT", headers, body });
+    expect(replay.response.status).toBe(204);
+    expect(replay.response.headers.get("ETag")).toBe(first.response.headers.get("ETag"));
+  });
+
+  it("uses strong If-Match and standard unsatisfied range responses", async () => {
+    const upload = await request("/nar/conditional-semantics.nar", { method: "PUT", headers: bearer("write-secret"), body: "0123456789" });
+    const etag = upload.response.headers.get("ETag") ?? "";
+    const weak = await request("/nar/conditional-semantics.nar", { method: "PUT", headers: { ...bearer("write-secret"), "If-Match": `W/${etag}` }, body: "0123456789" });
+    expect(weak.response.status).toBe(412);
+    const invalidRange = await request("/nar/conditional-semantics.nar", { headers: { Range: "bytes=99-" } });
+    expect(invalidRange.response.status).toBe(416);
+    expect(invalidRange.response.headers.get("Content-Range")).toBe("bytes */10");
+  });
+
+  it("rejects incomplete narinfo metadata", async () => {
+    await request("/nar/incomplete-narinfo.nar", { method: "PUT", headers: bearer("write-secret"), body: "payload" });
+    const response = await request("/incomplete-narinfo.narinfo", { method: "PUT", headers: bearer("write-secret"), body: "URL: /nar/incomplete-narinfo.nar\n" });
+    expect(response.response.status).toBe(422);
+  });
+
   it("accepts Nix netrc Basic credentials for uploads", async () => {
     const upload = await request("/nar/netrc-version.nar", { method: "PUT", headers: netrcBasic("write-secret"), body: "netrc" });
     expect(upload.response.status).toBe(201);
@@ -200,7 +250,7 @@ describe("Nix cache HTTP API", () => {
   });
 
   it("requires the referenced NAR before accepting narinfo", async () => {
-    const missing = await request("/missing-version.narinfo", { method: "PUT", headers: bearer("write-secret"), body: "URL: nar/does-not-exist.nar\nStorePath: /nix/store/missing\n" });
+    const missing = await request("/missing-version.narinfo", { method: "PUT", headers: bearer("write-secret"), body: narInfoBody("nar/does-not-exist.nar", "/nix/store/missing") });
     expect(missing.response.status).toBe(424);
     await uploadPair("strict-version");
   });
@@ -263,15 +313,39 @@ describe("Nix cache HTTP API", () => {
     expect((await request("/api/admin/packages/demo-package/versions/2.0", { headers: bearer("admin-secret") })).response.status).toBe(200);
   });
 
+  it("locks a version as soon as deletion is queued", async () => {
+    const pair = await uploadPair("deletion-lock");
+    expect((await register("deletion-lock-package", "v1", [pair.narinfoKey])).response.status).toBe(201);
+    const deletion = await request("/api/admin/packages/deletion-lock-package/versions/v1", {
+      method: "DELETE",
+      headers: { ...bearer("admin-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ confirmPackageName: "deletion-lock-package", confirmVersionName: "v1", reason: "race test" }),
+    });
+    expect(deletion.response.status).toBe(202);
+    const blocked = await register("deletion-lock-package", "v1", [pair.narinfoKey]);
+    expect(blocked.response.status).toBe(409);
+    await Promise.all(deletion.waitUntil);
+  });
+
+  it("reclaims stale running jobs", async () => {
+    const id = crypto.randomUUID();
+    const stale = new Date(Date.now() - 16 * 60_000).toISOString();
+    await testEnv.DB.prepare(
+      "INSERT INTO jobs (id, type, status, payload_json, created_at, updated_at) VALUES (?, 'gc', 'running', '{}', ?, ?)",
+    ).bind(id, stale, stale).run();
+    await runQueuedJobs(testEnv, 2);
+    expect((await testEnv.DB.prepare("SELECT status FROM jobs WHERE id = ?").bind(id).first<{ status: string }>())?.status).toBe("completed");
+  });
+
   it("preserves shared NARs while another version references them", async () => {
     const sharedNarKey = "nar/shared-version.nar";
     const sharedNar = await request(`/${sharedNarKey}`, { method: "PUT", headers: bearer("write-secret"), body: "shared-body" });
     expect([201, 204]).toContain(sharedNar.response.status);
     const shared = { narKey: sharedNarKey, narinfoKey: "shared-version-a.narinfo" };
-    const sharedNarinfo = await request(`/${shared.narinfoKey}`, { method: "PUT", headers: bearer("write-secret"), body: `URL: /${sharedNarKey}\nStorePath: /nix/store/shared-version-a\n` });
+    const sharedNarinfo = await request(`/${shared.narinfoKey}`, { method: "PUT", headers: bearer("write-secret"), body: narInfoBody(sharedNarKey, "/nix/store/shared-version-a") });
     expect([201, 204]).toContain(sharedNarinfo.response.status);
     const secondNarinfo = "shared-version-b.narinfo";
-    const second = await request(`/${secondNarinfo}`, { method: "PUT", headers: bearer("write-secret"), body: `URL: /${sharedNarKey}\nStorePath: /nix/store/shared-version-b\n` });
+    const second = await request(`/${secondNarinfo}`, { method: "PUT", headers: bearer("write-secret"), body: narInfoBody(sharedNarKey, "/nix/store/shared-version-b") });
     expect([201, 204]).toContain(second.response.status);
     expect((await register("shared-package", "a", [shared.narinfoKey])).response.status).toBe(201);
     expect((await register("shared-package", "b", [secondNarinfo])).response.status).toBe(201);

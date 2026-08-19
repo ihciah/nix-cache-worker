@@ -5,7 +5,7 @@ import { parseNarInfo } from "../domain/narinfo";
 import { kindForKey, normalizeKeyFromUrl } from "../domain/keys";
 import { emitAudit } from "../observability";
 import { getObject, now } from "../storage/db";
-import { putImmutableObject } from "../storage/r2";
+import { claimObjectWrite, putImmutableObject, releaseObjectWrite } from "../storage/r2";
 import { requireRole } from "../middleware/auth";
 import type { Context } from "hono";
 
@@ -17,18 +17,24 @@ export async function handleNarinfoPut(c: Context<AppEnv>): Promise<Response> {
   const bodyCopy = c.req.raw.clone();
   const text = await bodyCopy.text();
   const parsed = parseNarInfo(text);
-  const narObject = await c.env.CACHE_BUCKET.head(parsed.narKey);
-  const narIndex = await getObject(c.env, parsed.narKey);
-  if (!narObject || !narIndex || narIndex.state !== "ready") {
-    throw new AppError("missing_nar_dependency", "The narinfo references a missing NAR", 424, { narKey: parsed.narKey });
+  const dependencyOwner = await claimObjectWrite(c.env, parsed.narKey);
+  if (!dependencyOwner) throw new AppError("upload_in_progress", "The referenced NAR is being changed or deleted", 409);
+  try {
+    const narObject = await c.env.CACHE_BUCKET.head(parsed.narKey);
+    const narIndex = await getObject(c.env, parsed.narKey);
+    if (!narObject || !narIndex || narIndex.state !== "ready") {
+      throw new AppError("missing_nar_dependency", "The narinfo references a missing NAR", 424, { narKey: parsed.narKey });
+    }
+    const result = await putImmutableObject(c.env, key, "narinfo", c.req.raw);
+    await c.env.DB.prepare(
+      `INSERT INTO narinfo_refs (narinfo_key, nar_key, store_path, created_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(narinfo_key) DO UPDATE SET nar_key = excluded.nar_key, store_path = excluded.store_path`,
+    ).bind(key, parsed.narKey, parsed.storePath, now()).run();
+    await emitAudit(c.env, result.duplicate ? "narinfo_replay" : "narinfo_upload", c.get("role"), key, { narKey: parsed.narKey });
+    return new Response(null, { status: result.duplicate ? 204 : 201, headers: { ETag: result.object.httpEtag } });
+  } finally {
+    await releaseObjectWrite(c.env, parsed.narKey, dependencyOwner);
   }
-  const result = await putImmutableObject(c.env, key, "narinfo", c.req.raw);
-  await c.env.DB.prepare(
-    `INSERT INTO narinfo_refs (narinfo_key, nar_key, store_path, created_at) VALUES (?, ?, ?, ?)
-     ON CONFLICT(narinfo_key) DO UPDATE SET nar_key = excluded.nar_key, store_path = excluded.store_path`,
-  ).bind(key, parsed.narKey, parsed.storePath, now()).run();
-  emitAudit(c.env, result.duplicate ? "narinfo_replay" : "narinfo_upload", c.get("role"), key, { narKey: parsed.narKey });
-  return new Response(null, { status: result.duplicate ? 204 : 201, headers: { ETag: result.object.httpEtag } });
 }
 
 narinfoRoutes.put("/*", requireRole("write"), handleNarinfoPut);
