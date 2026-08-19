@@ -37,7 +37,8 @@ duplicate deletion requests observe these states and cannot mutate the target.
 Automatic GC jobs record their reason and re-check their target before
 processing legacy or otherwise recoverable jobs.
 
-All application uploads acquire the per-key D1 write claim. Multipart claims
+All application uploads acquire the per-key D1 write claim before preflighting
+R2 or D1, including idempotent retries for existing objects. Multipart claims
 are renewed while parts are being consumed. A key with a `deleting` D1 object
 row cannot be reused until deletion cleanup has completed.
 
@@ -112,6 +113,7 @@ existing status and payload fields.
 - GC does not delete a version that was pinned before execution.
 - Stale running jobs are reclaimed by the scheduler.
 - Concurrent normal and multipart writes cannot overwrite one another.
+- Existing-object retries remain mutually exclusive with an active key claim.
 - A retry repairs an R2 object whose D1 index is missing or lacks a digest.
 - Deleting and re-uploading the same key cannot cause the old job to delete the
   new object.

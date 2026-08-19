@@ -152,11 +152,36 @@ async function multipartPut(env: Bindings, key: string, kind: ObjectKind, reques
 }
 
 export async function putImmutableObject(env: Bindings, key: string, kind: ObjectKind, request: Request): Promise<UploadResult> {
-  const existing = await env.CACHE_BUCKET.head(key);
-  const indexed = await getObject(env, key);
-  if (indexed?.state === "deleting") throw new AppError("object_deleting", "The object is currently being deleted", 409);
-  if (existing) return duplicateDecision(env, key, kind, request, existing, indexed);
-  if (request.headers.get("If-Match")) throw new AppError("precondition_failed", "If-Match requires an existing object", 412);
+  const owner = await claimObjectWrite(env, key);
+  if (!owner) throw new AppError("upload_in_progress", "Another upload for this object is in progress", 409);
+
+  let existing: R2Object | null;
+  let indexed: Awaited<ReturnType<typeof getObject>>;
+  try {
+    existing = await env.CACHE_BUCKET.head(key);
+    indexed = await getObject(env, key);
+  } catch (error) {
+    await releaseObjectWrite(env, key, owner);
+    throw error;
+  }
+  if (indexed?.state === "deleting") {
+    await releaseObjectWrite(env, key, owner);
+    throw new AppError("object_deleting", "The object is currently being deleted", 409);
+  }
+  if (existing) {
+    try {
+      const result = await duplicateDecision(env, key, kind, request, existing, indexed);
+      await releaseObjectWrite(env, key, owner);
+      return result;
+    } catch (error) {
+      await releaseObjectWrite(env, key, owner);
+      throw error;
+    }
+  }
+  if (request.headers.get("If-Match")) {
+    await releaseObjectWrite(env, key, owner);
+    throw new AppError("precondition_failed", "If-Match requires an existing object", 412);
+  }
   if (etagMatches(request.headers.get("If-None-Match"), "*")) {
     // The object was absent at the preflight check, so a conditional write is still applied below.
   }
@@ -166,8 +191,6 @@ export async function putImmutableObject(env: Bindings, key: string, kind: Objec
   const parsedContentLength = contentLengthValid ? Number(contentLengthText) : 0;
   const contentLength = Number.isSafeInteger(parsedContentLength) ? parsedContentLength : 0;
   const useMultipart = contentLength > MULTIPART_THRESHOLD || (kind === "nar" && !contentLengthValid);
-  const owner = await claimObjectWrite(env, key);
-  if (!owner) throw new AppError("upload_in_progress", "Another upload for this object is in progress", 409);
   try {
     const raced = await env.CACHE_BUCKET.head(key);
     if (raced) return duplicateDecision(env, key, kind, request, raced, await getObject(env, key));

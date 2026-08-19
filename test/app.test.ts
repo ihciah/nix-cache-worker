@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { app } from "../src/app";
 import { createDeletionJob, runQueuedJobs } from "../src/jobs/jobs";
+import { claimObjectWrite, releaseObjectWrite } from "../src/storage/r2";
 import type { Bindings } from "../src/env";
 import { homePage } from "../src/ui/home";
 
@@ -200,6 +201,11 @@ describe("Nix cache HTTP API", () => {
   it("rejects different immutable content and accepts identical retries", async () => {
     const first = await request("/nar/immutable-version.nar", { method: "PUT", headers: bearer("write-secret"), body: "first" });
     expect(first.response.status).toBe(201);
+    const owner = await claimObjectWrite(testEnv, "nar/immutable-version.nar");
+    expect(owner).toBeTruthy();
+    const blockedDuplicate = await request("/nar/immutable-version.nar", { method: "PUT", headers: bearer("write-secret"), body: "first" });
+    expect(blockedDuplicate.response.status).toBe(409);
+    await releaseObjectWrite(testEnv, "nar/immutable-version.nar", owner as string);
     const duplicate = await request("/nar/immutable-version.nar", { method: "PUT", headers: bearer("write-secret"), body: "first" });
     expect(duplicate.response.status).toBe(204);
     const empty = await request("/nar/immutable-version.nar", { method: "PUT", headers: bearer("write-secret") });
