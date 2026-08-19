@@ -63,7 +63,8 @@ returns a non-null validated `StorePath`.
 
 Audit writes are awaited by mutation handlers and jobs. Cache generation is
 advanced before deletion starts, and structured cache/R2 events include method,
-status, object kind, and byte counts where applicable.
+status, object kind, and byte counts where applicable. Range HEAD responses
+emit the same `cache_hit` event as full-object HEAD responses.
 
 TTL calculation treats a second-pass membership scan that finds no active
 versions as unclassified, avoiding a long fallback retention TTL when a
@@ -138,6 +139,7 @@ existing status and payload fields.
   hot read/write paths.
 - Narinfo core-field and dependency validation, strong `If-Match`, and 416
   `Content-Range` behavior are tested.
+- Range HEAD responses preserve cache-hit observability.
 - Whitespace-only narinfo lines are accepted without weakening required-field
   validation.
 - Large GC/deletion work advances through bounded persistent batches.

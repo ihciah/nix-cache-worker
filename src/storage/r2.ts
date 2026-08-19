@@ -274,6 +274,7 @@ export async function getObjectResponse(env: Bindings, request: Request, key: st
     headers.set("Content-Length", String(range?.length ?? head.size));
     if (range) {
       headers.set("Content-Range", `bytes ${range.start}-${range.end}/${head.size}`);
+      emitMetric("cache_hit", { key, kind, method: "HEAD", status: 206, bytes: 0 });
       return new Response(null, { status: 206, headers });
     }
     emitMetric("cache_hit", { key, kind, method: "HEAD", status: 200, bytes: 0 });
