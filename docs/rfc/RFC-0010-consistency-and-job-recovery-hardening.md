@@ -69,6 +69,11 @@ membership disappears between the bounded scans. Existing-object PUTs also
 reject a missing request body before hashing so malformed retries receive the
 same `empty_body` response as first-time uploads.
 
+Administrative deletion requests that observe a version in `registering` (or
+lose the active-state race before acquiring the deletion lock) return the
+distinct `version_busy` conflict instead of reporting that deletion is already
+in progress.
+
 ## Invariants and security
 
 - A deleting version cannot be re-registered, patched, or pinned.
@@ -105,6 +110,7 @@ existing status and payload fields.
   `deleting` state.
 - Empty-body retries and membership disappearance during TTL calculation retain
   their safe error and cache-TTL behavior.
+- Deletion requests racing registration return the accurate busy conflict.
 - Narinfo core-field and dependency validation, strong `If-Match`, and 416
   `Content-Range` behavior are tested.
 - Large GC/deletion work advances through bounded persistent batches.

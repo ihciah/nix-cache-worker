@@ -334,7 +334,11 @@ adminRoutes.delete("/api/admin/packages/:packageName/versions/:versionName", asy
   });
   if (!jobId) {
     const racedJob = await findActiveDeletionJob(c.env, row.version_id);
-    if (!racedJob) throw new AppError("version_deleting", "The version could not be locked for deletion", 409);
+    if (!racedJob) {
+      const current = await getVersion(c.env, packageName, versionName);
+      if (current?.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
+      throw new AppError("version_busy", "The version changed before deletion could be locked", 409, { state: current?.state ?? "missing" });
+    }
     c.executionCtx.waitUntil(runJob(c.env, racedJob.id));
     return c.json({ jobId: racedJob.id, status: racedJob.status, versionId: row.version_id, packageName, versionName }, 202);
   }

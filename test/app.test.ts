@@ -329,6 +329,20 @@ describe("Nix cache HTTP API", () => {
     await Promise.all(deletion.waitUntil);
   });
 
+  it("reports a busy conflict when deleting a registering version", async () => {
+    const timestamp = new Date().toISOString();
+    await testEnv.DB.prepare(
+      "INSERT INTO artifact_versions (version_id, package_name, version_name, registered_at, updated_at, state) VALUES (?, ?, ?, ?, ?, 'registering')",
+    ).bind(crypto.randomUUID(), "registering-delete-package", "v1", timestamp, timestamp).run();
+    const deletion = await request("/api/admin/packages/registering-delete-package/versions/v1", {
+      method: "DELETE",
+      headers: { ...bearer("admin-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ confirmPackageName: "registering-delete-package", confirmVersionName: "v1", reason: "busy-state test" }),
+    });
+    expect(deletion.response.status).toBe(409);
+    expect((await deletion.response.json<{ error: { code: string } }>()).error.code).toBe("version_busy");
+  });
+
   it("reclaims stale running jobs", async () => {
     const id = crypto.randomUUID();
     const stale = new Date(Date.now() - 16 * 60_000).toISOString();
