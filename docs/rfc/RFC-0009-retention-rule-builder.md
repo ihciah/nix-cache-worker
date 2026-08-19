@@ -73,6 +73,10 @@ versions in each group, ordered by `registered_at DESC`. Grouping affects only
 last-N protection; `durationDays` is evaluated independently for every
 matching version.
 
+Protection evaluation keeps only the bounded top-N candidates for each
+rule/group and re-sorts a full candidate list only when a new version can enter
+that top-N set.
+
 ### Matching and retention combination
 
 For each active version, every matching rule contributes independently:
@@ -97,7 +101,8 @@ using the structured rule builder.
 The `gc_policies` table is recreated with `conditions_json`, `group_by_json`,
 `last_n`, and `duration_days` columns. The migration intentionally drops all
 existing policy rows. The admin API accepts and returns only the structured
-fields.
+fields. `lastN` is limited to 100,000 versions to keep protection evaluation
+bounded, while `durationDays` is limited independently to 36,500 days.
 
 ### Admin console
 
@@ -140,6 +145,8 @@ unchanged.
 - A rule with only duration, only lastN, or both behaves correctly.
 - Overlapping structured rules union protection and use the largest duration.
 - The admin API validates and round-trips structured rules.
+- The admin API applies independent count and duration limits with distinct
+  validation messages.
 - The admin console renders a valid rule editor without raw tag JSON input.
 - HTTP TTL, pins, shared objects, and direct Nix cache behavior remain intact.
 

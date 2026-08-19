@@ -4,9 +4,10 @@ import type { AppEnv } from "../env";
 import { AppError } from "../domain/errors";
 import {
   effectiveRetentionDays,
-  isProtectedByKeepLatest,
+  groupKey,
   isRetentionField,
   isRetentionOperator,
+  matchingPolicies,
   policyConditions,
   policyGroupBy,
   type PolicyRow,
@@ -15,7 +16,7 @@ import {
   type RetentionOperator,
 } from "../domain/policy";
 import { emitAudit } from "../observability";
-import { getJob, createJob, runJob } from "../jobs/jobs";
+import { getJob, createJob, createDeletionJob, findActiveDeletionJob, runJob } from "../jobs/jobs";
 import { bumpCacheGeneration, getSetting, getVersion, now, parseTags, type VersionRow } from "../storage/db";
 import { serializeVersion, validateNonNegativeInteger, validatePackageName, validateTags, validateVersionName } from "./versions";
 import { requireRole } from "../middleware/auth";
@@ -35,9 +36,37 @@ async function loadPolicies(env: AppEnv["Bindings"]): Promise<PolicyRow[]> {
   return result.results;
 }
 
-async function loadVersions(env: AppEnv["Bindings"]): Promise<VersionRow[]> {
-  const result = await env.DB.prepare("SELECT * FROM artifact_versions WHERE state != 'deleted' ORDER BY package_name, registered_at DESC").all<VersionRow>();
+async function loadVersionsForPackage(env: AppEnv["Bindings"], packageName: string): Promise<VersionRow[]> {
+  const result = await env.DB.prepare(
+    "SELECT * FROM artifact_versions WHERE package_name = ? AND state != 'deleted' ORDER BY registered_at DESC, version_id DESC",
+  ).bind(packageName).all<VersionRow>();
   return result.results;
+}
+
+async function loadVersionsForPackages(env: AppEnv["Bindings"], packageNames: string[]): Promise<VersionRow[]> {
+  if (!packageNames.length) return [];
+  const placeholders = packageNames.map(() => "?").join(",");
+  const result = await env.DB.prepare(
+    `SELECT * FROM artifact_versions
+     WHERE state != 'deleted' AND package_name IN (${placeholders})
+     ORDER BY package_name, registered_at DESC, version_id DESC`,
+  ).bind(...packageNames).all<VersionRow>();
+  return result.results;
+}
+
+async function listPackageNames(env: AppEnv["Bindings"], query: string, limit: number, offset: number): Promise<{ names: string[]; total: number }> {
+  const escapedQuery = query.replace(/[!%_]/g, (character) => `!${character}`);
+  const pattern = `%${escapedQuery}%`;
+  const where = `state != 'deleted' AND (
+    package_name COLLATE NOCASE LIKE ? ESCAPE '!' OR version_name COLLATE NOCASE LIKE ? ESCAPE '!' OR tags_json COLLATE NOCASE LIKE ? ESCAPE '!'
+  )`;
+  const [total, names] = await Promise.all([
+    env.DB.prepare(`SELECT COUNT(DISTINCT package_name) AS count FROM artifact_versions WHERE ${where}`)
+      .bind(pattern, pattern, pattern).first<{ count: number }>(),
+    env.DB.prepare(`SELECT DISTINCT package_name FROM artifact_versions WHERE ${where} ORDER BY package_name LIMIT ? OFFSET ?`)
+      .bind(pattern, pattern, pattern, limit, offset).all<{ package_name: string }>(),
+  ]);
+  return { names: names.results.map((row) => row.package_name), total: Number(total?.count ?? 0) };
 }
 
 async function fallbackRetention(env: AppEnv["Bindings"]): Promise<number> {
@@ -74,14 +103,14 @@ async function getVersionFiles(env: AppEnv["Bindings"], versionId: string): Prom
 async function versionSummary(
   env: AppEnv["Bindings"],
   row: VersionRow,
-  versions: VersionRow[],
+  protectedIds: Set<string>,
   policies: PolicyRow[],
   fallback: number,
   includeFiles = false,
 ): Promise<Record<string, unknown>> {
   const files = await getVersionFiles(env, row.version_id);
   const bytes = files.reduce((sum, file) => sum + (file.size ?? 0), 0);
-  const protectedByKeepLatest = isProtectedByKeepLatest(row, versions.filter((item) => item.state === "active"), policies);
+  const protectedByKeepLatest = protectedIds.has(row.version_id);
   const result: Record<string, unknown> = {
     ...serializeVersion(row),
     fileCount: files.length,
@@ -94,11 +123,58 @@ async function versionSummary(
   return result;
 }
 
+async function protectedVersionIdsForRows(env: AppEnv["Bindings"], rows: VersionRow[], policies: PolicyRow[]): Promise<Set<string>> {
+  const targets = new Map<string, number>();
+  for (const row of rows) {
+    for (const policy of matchingPolicies(row, policies)) {
+      const fields = policyGroupBy(policy);
+      const count = policy.last_n ?? 0;
+      if (!fields || count <= 0) continue;
+      targets.set(`${policy.id}:${groupKey(row, fields)}`, count);
+    }
+  }
+  if (!targets.size) return new Set();
+  const latest = new Map<string, Array<{ versionId: string; registeredAt: string }>>();
+  let lastVersionId = "";
+  while (true) {
+    const page = await env.DB.prepare(
+      `SELECT * FROM artifact_versions WHERE state = 'active' AND version_id > ? ORDER BY version_id LIMIT 200`,
+    ).bind(lastVersionId).all<VersionRow>();
+    for (const candidate of page.results) {
+      for (const policy of matchingPolicies(candidate, policies)) {
+        const fields = policyGroupBy(policy);
+        if (!fields) continue;
+        const targetKey = `${policy.id}:${groupKey(candidate, fields)}`;
+        const target = targets.get(targetKey);
+        if (!target) continue;
+        const list = latest.get(targetKey) ?? [];
+        const item = { versionId: candidate.version_id, registeredAt: candidate.registered_at };
+        if (list.length < target) {
+          list.push(item);
+          if (list.length === target) list.sort(compareRegisteredVersions);
+        } else {
+          const worst = list[list.length - 1];
+          if (worst && compareRegisteredVersions(item, worst) < 0) {
+            list[list.length - 1] = item;
+            list.sort(compareRegisteredVersions);
+          }
+        }
+        latest.set(targetKey, list);
+      }
+    }
+    if (page.results.length < 200) break;
+    lastVersionId = page.results[page.results.length - 1].version_id;
+  }
+  const protectedIds = new Set<string>();
+  for (const list of latest.values()) for (const item of list) protectedIds.add(item.versionId);
+  return protectedIds;
+}
+
 function packageItems(versions: VersionRow[], query: string): Map<string, VersionRow[]> {
   const groups = new Map<string, VersionRow[]>();
   for (const row of versions) {
     const tags = parseTags(row.tags_json);
-    const haystack = `${row.package_name} ${row.version_name} ${JSON.stringify(tags)}`.toLowerCase();
+    const haystack = `${row.package_name} ${row.version_name} ${row.tags_json} ${JSON.stringify(tags)}`.toLowerCase();
     if (query && !haystack.includes(query)) continue;
     const group = groups.get(row.package_name) ?? [];
     group.push(row);
@@ -107,15 +183,20 @@ function packageItems(versions: VersionRow[], query: string): Map<string, Versio
   return groups;
 }
 
+function compareRegisteredVersions(left: { versionId: string; registeredAt: string }, right: { versionId: string; registeredAt: string }): number {
+  return right.registeredAt.localeCompare(left.registeredAt) || right.versionId.localeCompare(left.versionId);
+}
+
 async function packageResponse(
   env: AppEnv["Bindings"],
   packageName: string,
   rows: VersionRow[],
-  allVersions: VersionRow[],
   policies: PolicyRow[],
   fallback: number,
+  protectedIds?: Set<string>,
 ): Promise<Record<string, unknown>> {
-  const versions = await Promise.all(rows.map((row) => versionSummary(env, row, allVersions, policies, fallback)));
+  const effectiveProtectedIds = protectedIds ?? await protectedVersionIdsForRows(env, rows, policies);
+  const versions = await Promise.all(rows.map((row) => versionSummary(env, row, effectiveProtectedIds, policies, fallback)));
   return {
     packageName,
     versionCount: versions.length,
@@ -167,15 +248,21 @@ adminRoutes.get("/api/admin/overview", async (c) => {
 
 adminRoutes.get("/api/admin/packages", async (c) => {
   const query = c.req.query("q")?.toLowerCase() ?? "";
-  const limit = Math.min(Math.max(Number(c.req.query("limit") ?? "50"), 1), 100);
-  const offset = Math.max(Number(c.req.query("offset") ?? "0"), 0);
-  const [versions, policies, fallback] = await Promise.all([loadVersions(c.env), loadPolicies(c.env), fallbackRetention(c.env)]);
+  const requestedLimit = Number(c.req.query("limit") ?? "50");
+  const requestedOffset = Number(c.req.query("offset") ?? "0");
+  const limit = Number.isSafeInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 50;
+  const offset = Number.isSafeInteger(requestedOffset) ? Math.max(requestedOffset, 0) : 0;
+  const [{ names: selectedNames, total }, policies, fallback] = await Promise.all([
+    listPackageNames(c.env, query, limit, offset),
+    loadPolicies(c.env),
+    fallbackRetention(c.env),
+  ]);
+  const versions = await loadVersionsForPackages(c.env, selectedNames);
   const groups = packageItems(versions, query);
-  const packageNames = [...groups.keys()].sort();
-  const page = packageNames.slice(offset, offset + limit);
+  const protectedIds = await protectedVersionIdsForRows(c.env, versions, policies);
   return c.json({
-    items: await Promise.all(page.map((packageName) => packageResponse(c.env, packageName, groups.get(packageName) ?? [], versions, policies, fallback))),
-    total: packageNames.length,
+    items: await Promise.all(selectedNames.map((packageName) => packageResponse(c.env, packageName, groups.get(packageName) ?? [], policies, fallback, protectedIds))),
+    total,
     offset,
     limit,
   });
@@ -186,16 +273,17 @@ adminRoutes.get("/api/admin/packages/:packageName/versions/:versionName", async 
   const versionName = validateVersionName(c.req.param("versionName"));
   const row = await getVersion(c.env, packageName, versionName);
   if (!row || row.state === "deleted") throw new AppError("not_found", "The version was not found", 404);
-  const [versions, policies, fallback] = await Promise.all([loadVersions(c.env), loadPolicies(c.env), fallbackRetention(c.env)]);
-  return c.json(await versionSummary(c.env, row, versions, policies, fallback, true));
+  const [policies, fallback] = await Promise.all([loadPolicies(c.env), fallbackRetention(c.env)]);
+  const protectedIds = await protectedVersionIdsForRows(c.env, [row], policies);
+  return c.json(await versionSummary(c.env, row, protectedIds, policies, fallback, true));
 });
 
 adminRoutes.get("/api/admin/packages/:packageName", async (c) => {
   const packageName = validatePackageName(c.req.param("packageName"));
-  const [versions, policies, fallback] = await Promise.all([loadVersions(c.env), loadPolicies(c.env), fallbackRetention(c.env)]);
-  const rows = versions.filter((row) => row.package_name === packageName);
+  const [rows, policies, fallback] = await Promise.all([loadVersionsForPackage(c.env, packageName), loadPolicies(c.env), fallbackRetention(c.env)]);
   if (!rows.length) throw new AppError("not_found", "The package was not found", 404);
-  return c.json(await packageResponse(c.env, packageName, rows, versions, policies, fallback));
+  const protectedIds = await protectedVersionIdsForRows(c.env, rows, policies);
+  return c.json(await packageResponse(c.env, packageName, rows, policies, fallback, protectedIds));
 });
 
 adminRoutes.patch("/api/admin/packages/:packageName/versions/:versionName", async (c) => {
@@ -203,17 +291,24 @@ adminRoutes.patch("/api/admin/packages/:packageName/versions/:versionName", asyn
   const versionName = validateVersionName(c.req.param("versionName"));
   const row = await getVersion(c.env, packageName, versionName);
   if (!row || row.state === "deleted") throw new AppError("not_found", "The version was not found", 404);
+  if (row.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
   const body = await c.req.json<Record<string, unknown>>().catch(() => { throw new AppError("invalid_json", "The request body must be JSON", 400); });
   const tags = body.tags === undefined ? parseTags(row.tags_json) : validateTags(body.tags);
   const retentionDays = body.retentionDays === undefined ? row.retention_days : validateNonNegativeInteger(body.retentionDays, "retention_days");
-  await c.env.DB.prepare("UPDATE artifact_versions SET tags_json = ?, retention_days = ?, updated_at = ? WHERE version_id = ?")
+  const updateResult = await c.env.DB.prepare("UPDATE artifact_versions SET tags_json = ?, retention_days = ?, updated_at = ? WHERE version_id = ? AND state = 'active'")
     .bind(JSON.stringify(tags), retentionDays, now(), row.version_id).run();
+  if (updateResult.meta.changes !== 1) {
+    const current = await getVersion(c.env, packageName, versionName);
+    if (current?.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
+    throw new AppError("version_busy", "The version changed before the update could be applied", 409, { state: current?.state ?? "missing" });
+  }
   await bumpCacheGeneration(c.env);
-  emitAudit(c.env, "version_update", c.get("role"), `${packageName}/${versionName}`, { versionId: row.version_id, tags, retentionDays });
+  await emitAudit(c.env, "version_update", c.get("role"), `${packageName}/${versionName}`, { versionId: row.version_id, tags, retentionDays });
   const updated = await getVersion(c.env, packageName, versionName);
   if (!updated) throw new AppError("not_found", "The version was not found", 404);
-  const [versions, policies, fallback] = await Promise.all([loadVersions(c.env), loadPolicies(c.env), fallbackRetention(c.env)]);
-  return c.json(await versionSummary(c.env, updated, versions, policies, fallback));
+  const [policies, fallback] = await Promise.all([loadPolicies(c.env), fallbackRetention(c.env)]);
+  const protectedIds = await protectedVersionIdsForRows(c.env, [updated], policies);
+  return c.json(await versionSummary(c.env, updated, protectedIds, policies, fallback));
 });
 
 async function setPin(c: Context<AppEnv>, pinned: boolean): Promise<Response> {
@@ -221,8 +316,14 @@ async function setPin(c: Context<AppEnv>, pinned: boolean): Promise<Response> {
   const versionName = validateVersionName(c.req.param("versionName") ?? "");
   const row = await getVersion(c.env, packageName, versionName);
   if (!row || row.state === "deleted") throw new AppError("not_found", "The version was not found", 404);
-  await c.env.DB.prepare("UPDATE artifact_versions SET pinned = ?, updated_at = ? WHERE version_id = ?").bind(pinned ? 1 : 0, now(), row.version_id).run();
-  emitAudit(c.env, pinned ? "version_pin" : "version_unpin", c.get("role"), `${packageName}/${versionName}`, { versionId: row.version_id });
+  if (row.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
+  const updated = await c.env.DB.prepare("UPDATE artifact_versions SET pinned = ?, updated_at = ? WHERE version_id = ? AND state = 'active'").bind(pinned ? 1 : 0, now(), row.version_id).run();
+  if (updated.meta.changes !== 1) {
+    const current = await getVersion(c.env, packageName, versionName);
+    if (current?.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
+    throw new AppError("version_busy", "The version changed before the pin state could be updated", 409, { state: current?.state ?? "missing" });
+  }
+  await emitAudit(c.env, pinned ? "version_pin" : "version_unpin", c.get("role"), `${packageName}/${versionName}`, { versionId: row.version_id });
   return c.json({ versionId: row.version_id, packageName, versionName, pinned });
 }
 
@@ -236,11 +337,34 @@ adminRoutes.delete("/api/admin/packages/:packageName/versions/:versionName", asy
   if (body.confirmPackageName !== packageName || body.confirmVersionName !== versionName) {
     throw new AppError("confirmation_required", "confirmPackageName and confirmVersionName must match the target", 422);
   }
-  if (!body.reason || body.reason.length > 512) throw new AppError("reason_required", "A deletion reason is required", 422);
+  if (typeof body.reason !== "string" || !body.reason.trim() || body.reason.length > 512) throw new AppError("reason_required", "A deletion reason is required", 422);
   const row = await getVersion(c.env, packageName, versionName);
   if (!row || row.state === "deleted") throw new AppError("not_found", "The version was not found", 404);
-  const jobId = await createJob(c.env, "delete_version", row.version_id, c.get("role"), { reason: body.reason, packageName, versionName, pinned: Boolean(row.pinned) });
-  emitAudit(c.env, "version_delete_requested", c.get("role"), `${packageName}/${versionName}`, { versionId: row.version_id, jobId, reason: body.reason, pinned: Boolean(row.pinned) });
+  const existingJob = await findActiveDeletionJob(c.env, row.version_id);
+  if (existingJob) {
+    await c.env.DB.prepare("UPDATE artifact_versions SET state = 'deleting', updated_at = ? WHERE version_id = ? AND state IN ('registering', 'active')")
+      .bind(now(), row.version_id).run();
+    c.executionCtx.waitUntil(runJob(c.env, existingJob.id));
+    return c.json({ jobId: existingJob.id, status: existingJob.status, versionId: row.version_id, packageName, versionName }, 202);
+  }
+  const jobId = await createDeletionJob(c.env, row.version_id, c.get("role"), {
+    reason: body.reason,
+    packageName,
+    versionName,
+    pinned: Boolean(row.pinned),
+    automaticGc: false,
+  });
+  if (!jobId) {
+    const racedJob = await findActiveDeletionJob(c.env, row.version_id);
+    if (!racedJob) {
+      const current = await getVersion(c.env, packageName, versionName);
+      if (current?.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
+      throw new AppError("version_busy", "The version changed before deletion could be locked", 409, { state: current?.state ?? "missing" });
+    }
+    c.executionCtx.waitUntil(runJob(c.env, racedJob.id));
+    return c.json({ jobId: racedJob.id, status: racedJob.status, versionId: row.version_id, packageName, versionName }, 202);
+  }
+  await emitAudit(c.env, "version_delete_requested", c.get("role"), `${packageName}/${versionName}`, { versionId: row.version_id, jobId, reason: body.reason, pinned: Boolean(row.pinned) });
   c.executionCtx.waitUntil(runJob(c.env, jobId));
   return c.json({ jobId, status: "queued", versionId: row.version_id, packageName, versionName }, 202);
 });
@@ -253,7 +377,7 @@ adminRoutes.get("/api/admin/jobs/:jobId", async (c) => {
 
 adminRoutes.post("/api/admin/gc", async (c) => {
   const jobId = await createJob(c.env, "gc", null, c.get("role"), { reason: "manual" });
-  emitAudit(c.env, "gc_requested", c.get("role"), null, { jobId });
+  await emitAudit(c.env, "gc_requested", c.get("role"), null, { jobId });
   c.executionCtx.waitUntil(runJob(c.env, jobId));
   return c.json({ jobId, status: "queued" }, 202);
 });
@@ -265,6 +389,9 @@ type PolicyPayload = {
   lastN: number | null;
   durationDays: number | null;
 };
+
+const MAX_KEEP_LATEST_VERSIONS = 100_000;
+const MAX_RETENTION_DAYS = 36_500;
 
 function validatePolicyBody(body: Record<string, unknown>): PolicyPayload {
   const name = typeof body.name === "string" ? body.name : "";
@@ -288,13 +415,15 @@ function validatePolicyBody(body: Record<string, unknown>): PolicyPayload {
   }
   const groupBy = [...new Set(rawGroupBy as string[])] as RetentionField[];
 
-  const parse = (value: unknown, field: string): number | null => {
+  const parse = (value: unknown, field: string, maximum: number, unit: string): number | null => {
     if (value === null || value === undefined) return null;
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new AppError("invalid_policy", `${field} must be a non-negative integer`, 422);
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > maximum) {
+      throw new AppError("invalid_policy", `${field} must be a non-negative integer no greater than ${maximum} ${unit}`, 422);
+    }
     return value;
   };
-  const lastN = parse(body.lastN, "lastN");
-  const durationDays = parse(body.durationDays, "durationDays");
+  const lastN = parse(body.lastN, "lastN", MAX_KEEP_LATEST_VERSIONS, "versions");
+  const durationDays = parse(body.durationDays, "durationDays", MAX_RETENTION_DAYS, "days");
   if (lastN === null && durationDays === null) throw new AppError("invalid_policy", "Set lastN, durationDays, or both", 422);
   return { name, conditions, groupBy, lastN, durationDays };
 }
@@ -325,7 +454,7 @@ adminRoutes.post("/api/admin/policies", async (c) => {
     "INSERT INTO gc_policies (name, conditions_json, group_by_json, last_n, duration_days, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
   ).bind(policy.name, JSON.stringify(policy.conditions), JSON.stringify(policy.groupBy), policy.lastN, policy.durationDays, timestamp, timestamp).run();
   await bumpCacheGeneration(c.env);
-  emitAudit(c.env, "policy_create", c.get("role"), policy.name);
+  await emitAudit(c.env, "policy_create", c.get("role"), policy.name);
   return c.json({ id: result.meta.last_row_id, ...policy }, 201);
 });
 
@@ -339,7 +468,7 @@ adminRoutes.put("/api/admin/policies/:policyId", async (c) => {
   ).bind(policy.name, JSON.stringify(policy.conditions), JSON.stringify(policy.groupBy), policy.lastN, policy.durationDays, now(), id).run();
   if (result.meta.changes === 0) throw new AppError("not_found", "The policy was not found", 404);
   await bumpCacheGeneration(c.env);
-  emitAudit(c.env, "policy_update", c.get("role"), String(id));
+  await emitAudit(c.env, "policy_update", c.get("role"), String(id));
   return c.json({ id, ...policy });
 });
 
@@ -349,7 +478,7 @@ adminRoutes.delete("/api/admin/policies/:policyId", async (c) => {
   const result = await c.env.DB.prepare("DELETE FROM gc_policies WHERE id = ?").bind(id).run();
   if (result.meta.changes === 0) throw new AppError("not_found", "The policy was not found", 404);
   await bumpCacheGeneration(c.env);
-  emitAudit(c.env, "policy_delete", c.get("role"), String(id));
+  await emitAudit(c.env, "policy_delete", c.get("role"), String(id));
   return c.body(null, 204);
 });
 
@@ -379,6 +508,6 @@ adminRoutes.put("/api/admin/settings", async (c) => {
     ).bind(key, value, now()).run();
   }
   if (Object.keys(body).length > 0) await bumpCacheGeneration(c.env);
-  emitAudit(c.env, "settings_update", c.get("role"), null, { keys: Object.keys(body) });
+  await emitAudit(c.env, "settings_update", c.get("role"), null, { keys: Object.keys(body) });
   return c.json({ ok: true });
 });

@@ -25,6 +25,50 @@ export async function createJob(env: Bindings, type: JobRow["type"], targetVersi
   return id;
 }
 
+export async function findActiveDeletionJob(env: Bindings, versionId: string): Promise<JobRow | null> {
+  return env.DB.prepare(
+    "SELECT * FROM jobs WHERE type = 'delete_version' AND target_version_id = ? AND status IN ('queued', 'running', 'failed') ORDER BY created_at ASC LIMIT 1",
+  ).bind(versionId).first<JobRow>();
+}
+
+/**
+ * Atomically lock a version for deletion and create its resumable job.
+ * SQLite's changes() is evaluated by the INSERT immediately after the UPDATE,
+ * so a failed conditional transition cannot leave an orphaned job row.
+ */
+export async function createDeletionJob(
+  env: Bindings,
+  targetVersionId: string,
+  actor: string,
+  payload: Record<string, unknown> = {},
+  options: { automaticGc?: boolean; expectedUpdatedAt?: string } = {},
+): Promise<string | null> {
+  const id = crypto.randomUUID();
+  const timestamp = now();
+  const conditions = options.automaticGc
+    ? "state = 'active' AND pinned = 0"
+    : "state IN ('active', 'deleting')";
+  const updatedAtCondition = options.expectedUpdatedAt === undefined ? "" : " AND updated_at = ?";
+  const updateBindings = options.expectedUpdatedAt === undefined
+    ? [timestamp, targetVersionId]
+    : [timestamp, targetVersionId, options.expectedUpdatedAt];
+  const insertBindings = [id, targetVersionId, JSON.stringify(payload), actor, timestamp, timestamp, targetVersionId];
+  const statements = [
+    env.DB.prepare(
+      `UPDATE artifact_versions SET state = 'deleting', updated_at = ?
+       WHERE version_id = ? AND ${conditions}${updatedAtCondition}`,
+    ).bind(...updateBindings),
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO jobs (id, type, status, target_version_id, payload_json, created_by, created_at, updated_at)
+       SELECT ?, 'delete_version', 'queued', ?, ?, ?, ?, ?
+       WHERE changes() = 1
+         AND EXISTS (SELECT 1 FROM artifact_versions WHERE version_id = ? AND state = 'deleting')`,
+    ).bind(...insertBindings),
+  ];
+  const results = await env.DB.batch(statements);
+  return results[1]?.meta.changes === 1 ? id : null;
+}
+
 export async function getJob(env: Bindings, id: string): Promise<JobRow | null> {
   return env.DB.prepare("SELECT * FROM jobs WHERE id = ?").bind(id).first<JobRow>();
 }
@@ -34,7 +78,7 @@ export async function runJob(env: Bindings, id: string): Promise<void> {
   if (!job || job.status === "completed") return;
   const staleBefore = new Date(Date.now() - 15 * 60_000).toISOString();
   const claimed = await env.DB.prepare(
-    `UPDATE jobs SET status = 'running', attempts = attempts + 1, updated_at = ?
+    `UPDATE jobs SET status = 'running', attempts = attempts + 1, last_error = NULL, updated_at = ?
      WHERE id = ? AND (status IN ('queued', 'failed') OR (status = 'running' AND updated_at < ?))`,
   ).bind(now(), id, staleBefore).run();
   if (claimed.meta.changes === 0) return;
@@ -48,11 +92,19 @@ export async function runJob(env: Bindings, id: string): Promise<void> {
   }
 }
 
+export async function touchJob(env: Bindings, id: string): Promise<void> {
+  await env.DB.prepare("UPDATE jobs SET updated_at = ? WHERE id = ? AND status = 'running'").bind(now(), id).run();
+}
+
 export async function runQueuedJobs(env: Bindings, limit = 2): Promise<void> {
   for (let round = 0; round < 4; round += 1) {
+    const staleBefore = new Date(Date.now() - 15 * 60_000).toISOString();
     const jobs = await env.DB.prepare(
-      "SELECT id FROM jobs WHERE status IN ('queued', 'failed') ORDER BY updated_at ASC LIMIT ?",
-    ).bind(limit).all<{ id: string }>();
+      `SELECT id FROM jobs
+       WHERE status IN ('queued', 'failed')
+          OR (status = 'running' AND updated_at < ?)
+       ORDER BY updated_at ASC LIMIT ?`,
+    ).bind(staleBefore, limit).all<{ id: string }>();
     if (jobs.results.length === 0) return;
     for (const job of jobs.results) await runJob(env, job.id);
   }

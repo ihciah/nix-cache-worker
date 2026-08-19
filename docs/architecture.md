@@ -41,6 +41,11 @@ its complete tags and member declaration while preserving its original
 The version membership query also associates each member's referenced NAR with
 the version. This lets both the narinfo and NAR receive the same effective
 response TTL, while shared NAR payloads remain protected by live references.
+Deletion transitions are persisted before a job is returned, while a
+multi-batch registration holds its version in `registering`. Deletion only
+claims active versions, and object deletion applies a live-reference guard at
+the state transition; deleting object keys cannot be reused until cleanup
+completes.
 
 ## Retention and jobs
 
