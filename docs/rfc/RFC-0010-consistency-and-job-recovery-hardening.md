@@ -74,6 +74,10 @@ lose the active-state race before acquiring the deletion lock) return the
 distinct `version_busy` conflict instead of reporting that deletion is already
 in progress.
 
+Deletion-job insertion ignores the active-job uniqueness conflict. The caller
+re-reads the existing job after a conflict, so concurrent deletion requests
+remain idempotent instead of surfacing a database constraint error.
+
 The write-claim expiry cleanup is indexed by `expires_at` so the per-upload
 claim path does not scan the complete claims table. TTL evaluation computes
 retention during its bounded membership scan and uses a separate existence
@@ -116,6 +120,8 @@ existing status and payload fields.
 - Empty-body retries and membership disappearance during TTL calculation retain
   their safe error and cache-TTL behavior.
 - Deletion requests racing registration return the accurate busy conflict.
+- Concurrent deletion-job creation returns the already queued job instead of a
+  database constraint error.
 - Write-claim expiry cleanup and TTL evaluation remain bounded on hot read/write
   paths.
 - Narinfo core-field and dependency validation, strong `If-Match`, and 416

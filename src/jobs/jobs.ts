@@ -59,7 +59,7 @@ export async function createDeletionJob(
        WHERE version_id = ? AND ${conditions}${updatedAtCondition}`,
     ).bind(...updateBindings),
     env.DB.prepare(
-      `INSERT INTO jobs (id, type, status, target_version_id, payload_json, created_by, created_at, updated_at)
+      `INSERT OR IGNORE INTO jobs (id, type, status, target_version_id, payload_json, created_by, created_at, updated_at)
        SELECT ?, 'delete_version', 'queued', ?, ?, ?, ?, ?
        WHERE changes() = 1
          AND EXISTS (SELECT 1 FROM artifact_versions WHERE version_id = ? AND state = 'deleting')`,

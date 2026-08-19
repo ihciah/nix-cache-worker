@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { app } from "../src/app";
-import { runQueuedJobs } from "../src/jobs/jobs";
+import { createDeletionJob, runQueuedJobs } from "../src/jobs/jobs";
 import type { Bindings } from "../src/env";
 import { homePage } from "../src/ui/home";
 
@@ -328,6 +328,24 @@ describe("Nix cache HTTP API", () => {
     const blocked = await register("deletion-lock-package", "v1", [pair.narinfoKey]);
     expect(blocked.response.status).toBe(409);
     await Promise.all(deletion.waitUntil);
+  });
+
+  it("treats a concurrent deletion-job insert as an existing job", async () => {
+    const versionId = crypto.randomUUID();
+    const timestamp = new Date().toISOString();
+    const existingJobId = crypto.randomUUID();
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        "INSERT INTO artifact_versions (version_id, package_name, version_name, registered_at, updated_at, state) VALUES (?, ?, ?, ?, ?, 'active')",
+      ).bind(versionId, "duplicate-delete-job-package", "v1", timestamp, timestamp),
+      testEnv.DB.prepare(
+        "INSERT INTO jobs (id, type, status, target_version_id, payload_json, created_at, updated_at) VALUES (?, 'delete_version', 'queued', ?, '{}', ?, ?)",
+      ).bind(existingJobId, versionId, timestamp, timestamp),
+    ]);
+
+    await expect(createDeletionJob(testEnv, versionId, "admin", { reason: "race test" })).resolves.toBeNull();
+    expect((await testEnv.DB.prepare("SELECT state FROM artifact_versions WHERE version_id = ?").bind(versionId).first<{ state: string }>())?.state).toBe("deleting");
+    expect((await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM jobs WHERE target_version_id = ?").bind(versionId).first<{ count: number }>())?.count).toBe(1);
   });
 
   it("reports a busy conflict when deleting a registering version", async () => {
