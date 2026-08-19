@@ -86,10 +86,11 @@ Deletion-job insertion ignores the active-job uniqueness conflict. The caller
 re-reads the existing job after a conflict, so concurrent deletion requests
 remain idempotent instead of surfacing a database constraint error.
 
-The write-claim expiry cleanup is indexed by `expires_at` so the per-upload
-claim path does not scan the complete claims table. TTL evaluation computes
-retention during its bounded membership scan and uses a separate existence
-check only to detect membership disappearing before the response is formed.
+The write-claim expiry cleanup is indexed by `expires_at` and rate-limited per
+Worker isolate so hot upload and deletion loops do not issue a cleanup query
+for every claim. TTL evaluation computes retention during its bounded
+membership scan and uses a separate existence check only to detect membership
+disappearing before the response is formed.
 
 ## Invariants and security
 
@@ -133,8 +134,8 @@ existing status and payload fields.
   registering or changing state.
 - Concurrent deletion-job creation returns the already queued job instead of a
   database constraint error.
-- Write-claim expiry cleanup and TTL evaluation remain bounded on hot read/write
-  paths.
+- Write-claim expiry cleanup is amortized and TTL evaluation remains bounded on
+  hot read/write paths.
 - Narinfo core-field and dependency validation, strong `If-Match`, and 416
   `Content-Range` behavior are tested.
 - Whitespace-only narinfo lines are accepted without weakening required-field

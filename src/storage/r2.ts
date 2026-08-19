@@ -9,6 +9,8 @@ import { cacheControlForObject } from "./retention";
 const MULTIPART_THRESHOLD = 8 * 1024 * 1024;
 const PART_SIZE = 8 * 1024 * 1024;
 const WRITE_CLAIM_TTL_MS = 15 * 60_000;
+const WRITE_CLAIM_CLEANUP_INTERVAL_MS = 60_000;
+let lastWriteClaimCleanupAt = 0;
 
 export type UploadResult = {
   object: R2Object;
@@ -35,8 +37,12 @@ function strongEtagMatches(header: string | null, etag: string): boolean {
 
 export async function claimObjectWrite(env: Bindings, key: string): Promise<string | null> {
   const owner = crypto.randomUUID();
-  const expiresAt = new Date(Date.now() + WRITE_CLAIM_TTL_MS).toISOString();
-  await env.DB.prepare("DELETE FROM write_claims WHERE expires_at < ?").bind(now()).run();
+  const currentTime = Date.now();
+  const expiresAt = new Date(currentTime + WRITE_CLAIM_TTL_MS).toISOString();
+  if (currentTime - lastWriteClaimCleanupAt >= WRITE_CLAIM_CLEANUP_INTERVAL_MS) {
+    lastWriteClaimCleanupAt = currentTime;
+    await env.DB.prepare("DELETE FROM write_claims WHERE expires_at < ?").bind(new Date(currentTime).toISOString()).run();
+  }
   const result = await env.DB.prepare(
     "INSERT OR IGNORE INTO write_claims (r2_key, owner, expires_at) VALUES (?, ?, ?)",
   ).bind(key, owner, expiresAt).run();

@@ -40,7 +40,7 @@ function parsePayload<T>(value: string, fallback: T): T {
   }
 }
 
-async function updateJob(env: Bindings, jobId: string, payload: Record<string, unknown>, status: "queued" | "completed", cursor = 0): Promise<void> {
+async function updateJob(env: Bindings, jobId: string, payload: Record<string, unknown>, status: "queued" | "running" | "completed", cursor = 0): Promise<void> {
   await env.DB.prepare("UPDATE jobs SET status = ?, cursor = ?, payload_json = ?, updated_at = ? WHERE id = ?")
     .bind(status, cursor, JSON.stringify(payload), now(), jobId).run();
 }
@@ -280,8 +280,8 @@ export async function processDeleteVersion(env: Bindings, jobId: string): Promis
   }
   if (!payload.phase) {
     await bumpCacheGeneration(env);
+    await updateJob(env, jobId, { ...payload, phase: "members" }, "running", job.cursor);
     payload.phase = "members";
-    await touchJob(env, jobId);
   }
   if (payload.phase === "cleanup_nars") {
     await cleanupNars(env, jobId, version);
