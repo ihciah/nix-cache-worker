@@ -164,6 +164,19 @@ describe("Structured retention rule API", () => {
     expect(createdBody.lastN).toBe(2);
     expect(createdBody.durationDays).toBe(30);
 
+    const highCount = await request("/api/admin/policies", {
+      method: "POST",
+      headers: { ...bearer("admin-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "api-high-count-rule", conditions: [{ field: "pkg_name", operator: "equals", value: "never-match", negate: false }], groupBy: [], lastN: 36_501, durationDays: null }),
+    });
+    expect(highCount.response.status).toBe(201);
+    const tooMany = await request("/api/admin/policies", {
+      method: "POST",
+      headers: { ...bearer("admin-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "api-too-many-rule", conditions: [], groupBy: [], lastN: 100_001, durationDays: null }),
+    });
+    expect(tooMany.response.status).toBe(422);
+
     const listed = await request("/api/admin/policies", { headers: bearer("admin-secret") });
     expect(listed.response.status).toBe(200);
     expect((await listed.response.json<{ items: Array<{ name: string }> }>()).items.some((item) => item.name === payload.name)).toBe(true);

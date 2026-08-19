@@ -30,7 +30,7 @@ export function parseNarInfo(text: string): ParsedNarInfo {
     throw new AppError("invalid_narinfo", "The narinfo URL is not valid UTF-8", 422);
   }
   if (narKey.includes("..")) {
-    throw new AppError("invalid_narinfo", "The narinfo URL must reference a /nar/ object", 422);
+    throw new AppError("invalid_narinfo", "The narinfo URL must not contain '..'", 422);
   }
   try {
     if (kindForKey(narKey) !== "nar") throw new Error("not-nar");

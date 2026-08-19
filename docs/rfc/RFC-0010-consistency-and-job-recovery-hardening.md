@@ -59,7 +59,8 @@ Narinfo parsing validates the core fields required for usable Nix metadata and
 continues to require the referenced NAR to be present and indexed. `If-Match`
 uses strong ETag comparison; invalid ranges return the standard unsatisfied
 range header. Whitespace-only narinfo lines are ignored, and successful parsing
-returns a non-null validated `StorePath`.
+returns a non-null validated `StorePath`; path traversal in a narinfo URL is
+rejected with a dedicated validation message.
 
 Audit writes are awaited by mutation handlers and jobs. Cache generation is
 advanced before deletion starts, and structured cache/R2 events include method,

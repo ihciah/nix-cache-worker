@@ -377,6 +377,9 @@ type PolicyPayload = {
   durationDays: number | null;
 };
 
+const MAX_KEEP_LATEST_VERSIONS = 100_000;
+const MAX_RETENTION_DAYS = 36_500;
+
 function validatePolicyBody(body: Record<string, unknown>): PolicyPayload {
   const name = typeof body.name === "string" ? body.name : "";
   if (!/^[A-Za-z0-9._~-]{1,64}$/.test(name)) throw new AppError("invalid_policy", "Policy name is invalid", 422);
@@ -399,13 +402,15 @@ function validatePolicyBody(body: Record<string, unknown>): PolicyPayload {
   }
   const groupBy = [...new Set(rawGroupBy as string[])] as RetentionField[];
 
-  const parse = (value: unknown, field: string): number | null => {
+  const parse = (value: unknown, field: string, maximum: number, unit: string): number | null => {
     if (value === null || value === undefined) return null;
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > 36_500) throw new AppError("invalid_policy", `${field} must be a non-negative integer no greater than 36500`, 422);
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > maximum) {
+      throw new AppError("invalid_policy", `${field} must be a non-negative integer no greater than ${maximum} ${unit}`, 422);
+    }
     return value;
   };
-  const lastN = parse(body.lastN, "lastN");
-  const durationDays = parse(body.durationDays, "durationDays");
+  const lastN = parse(body.lastN, "lastN", MAX_KEEP_LATEST_VERSIONS, "versions");
+  const durationDays = parse(body.durationDays, "durationDays", MAX_RETENTION_DAYS, "days");
   if (lastN === null && durationDays === null) throw new AppError("invalid_policy", "Set lastN, durationDays, or both", 422);
   return { name, conditions, groupBy, lastN, durationDays };
 }
