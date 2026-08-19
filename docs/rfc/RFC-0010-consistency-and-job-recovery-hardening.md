@@ -93,7 +93,8 @@ for every claim. A claim insert also atomically replaces an expired row for its
 requested key, so cleanup amortization cannot extend that key's lock lifetime.
 TTL evaluation computes retention during its bounded membership scan and uses a
 separate existence check only to detect membership disappearing before the
-response is formed.
+response is formed. Administrative package search escapes SQL LIKE wildcards so
+database selection and in-memory filtering use literal query semantics.
 
 ## Invariants and security
 
@@ -141,6 +142,7 @@ existing status and payload fields.
   hot read/write paths.
 - An expired claim is immediately reclaimable for the key being requested.
 - Package search preserves SQL matches for raw tag JSON formatting.
+- Package search treats `%` and `_` as literal query characters.
 - Narinfo core-field and dependency validation, strong `If-Match`, and 416
   `Content-Range` behavior are tested.
 - Range HEAD responses preserve cache-hit observability.

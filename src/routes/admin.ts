@@ -55,9 +55,10 @@ async function loadVersionsForPackages(env: AppEnv["Bindings"], packageNames: st
 }
 
 async function listPackageNames(env: AppEnv["Bindings"], query: string, limit: number, offset: number): Promise<{ names: string[]; total: number }> {
-  const pattern = `%${query}%`;
+  const escapedQuery = query.replace(/[!%_]/g, (character) => `!${character}`);
+  const pattern = `%${escapedQuery}%`;
   const where = `state != 'deleted' AND (
-    package_name LIKE ? COLLATE NOCASE OR version_name LIKE ? COLLATE NOCASE OR tags_json LIKE ? COLLATE NOCASE
+    package_name COLLATE NOCASE LIKE ? ESCAPE '!' OR version_name COLLATE NOCASE LIKE ? ESCAPE '!' OR tags_json COLLATE NOCASE LIKE ? ESCAPE '!'
   )`;
   const [total, names] = await Promise.all([
     env.DB.prepare(`SELECT COUNT(DISTINCT package_name) AS count FROM artifact_versions WHERE ${where}`)

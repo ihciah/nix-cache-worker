@@ -234,6 +234,11 @@ describe("Nix cache HTTP API", () => {
     expect(result.response.status).toBe(200);
     const body = await result.response.json<{ items: Array<{ packageName: string; versionCount: number }> }>();
     expect(body.items.find((item) => item.packageName === "formatted-search-package")?.versionCount).toBe(1);
+    await testEnv.DB.prepare(
+      "INSERT INTO artifact_versions (version_id, package_name, version_name, tags_json, registered_at, updated_at, state) VALUES (?, ?, ?, ?, ?, ?, 'active')",
+    ).bind(crypto.randomUUID(), "literal-wildcard-package", "v1", "{}", timestamp, timestamp).run();
+    const wildcard = await request("/api/admin/packages?q=_", { headers: bearer("admin-secret") });
+    expect((await wildcard.response.json<{ items: Array<{ packageName: string }> }>()).items.some((item) => item.packageName === "literal-wildcard-package")).toBe(false);
   });
 
   it("repairs a missing D1 object index on an idempotent retry", async () => {
