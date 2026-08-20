@@ -96,9 +96,10 @@ Authorization: Bearer <write-token>
 ```
 
 The registration body lists all narinfo members and may include arbitrary tags
-and a version-level retention override. Registration is idempotent and
-preserves `registered_at` for an existing package/version identity. Version
-names are opaque and are never parsed for ordering.
+and a version-level retention override. Registration is idempotent: an existing
+package/version identity is accepted again and its successful registration
+renews `registered_at`. Version names are opaque and are never parsed for
+ordering.
 
 ## Retention and garbage collection
 

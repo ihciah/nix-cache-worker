@@ -228,6 +228,16 @@ describe("Nix cache HTTP API", () => {
     expect(conflict.response.status).toBe(409);
   });
 
+  it("accepts an identical narinfo retry", async () => {
+    const pair = await uploadPair("idempotent-narinfo");
+    const replay = await request(`/${pair.narinfoKey}`, {
+      method: "PUT",
+      headers: bearer("write-secret"),
+      body: narInfoBody(pair.narKey, "/nix/store/idempotent-narinfo"),
+    });
+    expect(replay.response.status).toBe(204);
+  });
+
   it("reclaims an expired write claim for the requested key", async () => {
     const seedOwner = await claimObjectWrite(testEnv, "claim-cleanup-seed");
     expect(seedOwner).toBeTruthy();
@@ -315,7 +325,7 @@ describe("Nix cache HTTP API", () => {
     await uploadPair("strict-version");
   });
 
-  it("uses version retention after package/version registration and preserves registration order", async () => {
+  it("uses version retention after package/version registration and refreshes registration order on replay", async () => {
     const pair = await uploadPair("ttl-version");
     const beforeNar = await request(`/${pair.narKey}`);
     const beforeNarinfo = await request(`/${pair.narinfoKey}`);
@@ -323,14 +333,20 @@ describe("Nix cache HTTP API", () => {
     expect(beforeNarinfo.response.headers.get("Cache-Control")).toBe("public, max-age=21600");
     const registration = await register("ttl-package", "2026.1", [pair.narinfoKey], { retentionDays: 2, tags: { channel: "stable" } });
     expect(registration.response.status).toBe(201);
-    const first = await registration.response.json<{ registeredAt: string }>();
     const afterNar = await request(`/${pair.narKey}`);
     const afterNarinfo = await request(`/${pair.narinfoKey}`);
     expect(afterNar.response.headers.get("Cache-Control")).toBe("public, max-age=172800, immutable");
     expect(afterNarinfo.response.headers.get("Cache-Control")).toBe("public, max-age=172800");
+    const oldRegisteredAt = "2000-01-01T00:00:00.000Z";
+    await testEnv.DB.prepare("UPDATE artifact_versions SET registered_at = ? WHERE package_name = ? AND version_name = ?")
+      .bind(oldRegisteredAt, "ttl-package", "2026.1").run();
     const replay = await register("ttl-package", "2026.1", [pair.narinfoKey], { retentionDays: 3 });
     expect(replay.response.status).toBe(200);
-    expect((await replay.response.json<{ registeredAt: string }>()).registeredAt).toBe(first.registeredAt);
+    const replayed = await replay.response.json<{ registeredAt: string }>();
+    expect(Date.parse(replayed.registeredAt)).toBeGreaterThan(Date.parse(oldRegisteredAt));
+    const persisted = await testEnv.DB.prepare("SELECT registered_at FROM artifact_versions WHERE package_name = ? AND version_name = ?")
+      .bind("ttl-package", "2026.1").first<{ registered_at: string }>();
+    expect(persisted?.registered_at).toBe(replayed.registeredAt);
   });
 
   it("shows finite retention duration and remaining days separately in the admin API", async () => {

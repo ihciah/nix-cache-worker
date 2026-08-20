@@ -177,8 +177,9 @@ version. Both path components are URL-safe single segments of 1–128
 characters. A version may contain at most 10,000 narinfo members.
 
 Each version records a `registered_at` timestamp. Re-registering the same
-package/version preserves that timestamp; a new build version creates a new
-timestamp and identity.
+package/version renews that timestamp, so finite retention age and
+`keepLatestVersions` ordering reflect the latest successful complete
+declaration. A new build version creates a new identity.
 
 ## Management console and API
 

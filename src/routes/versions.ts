@@ -104,7 +104,7 @@ versionRoutes.put("/api/packages/:packageName/versions/:versionName", requireRol
     const existing = await getVersion(c.env, packageName, versionName);
     if (existing?.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
     const requestedVersionId = existing?.version_id ?? crypto.randomUUID();
-    const registeredAt = existing?.registered_at ?? timestamp;
+    const registeredAt = timestamp;
 
     await c.env.DB.prepare(
       `INSERT INTO artifact_packages (package_name, created_at, updated_at) VALUES (?, ?, ?)
@@ -114,7 +114,8 @@ versionRoutes.put("/api/packages/:packageName/versions/:versionName", requireRol
       `INSERT INTO artifact_versions (version_id, package_name, version_name, tags_json, retention_days, pinned, registered_at, updated_at, state)
        VALUES (?, ?, ?, ?, ?, COALESCE((SELECT pinned FROM artifact_versions WHERE version_id = ?), 0), ?, ?, 'registering')
        ON CONFLICT(package_name, version_name) DO UPDATE SET tags_json = excluded.tags_json,
-         retention_days = excluded.retention_days, updated_at = excluded.updated_at,
+         retention_days = excluded.retention_days, registered_at = excluded.registered_at,
+         updated_at = excluded.updated_at,
          state = 'registering'
        WHERE artifact_versions.state != 'deleting'`,
     ).bind(requestedVersionId, packageName, versionName, JSON.stringify(tags), retentionDays, requestedVersionId, registeredAt, timestamp).run();
@@ -149,7 +150,7 @@ versionRoutes.put("/api/packages/:packageName/versions/:versionName", requireRol
     if (activated.meta.changes !== 1) throw new AppError("version_deleting", "The version is currently being deleted", 409);
     await bumpCacheGeneration(c.env);
     await emitAudit(c.env, existing ? "version_update" : "version_create", c.get("role"), `${packageName}/${versionName}`, { versionId, members: members.length, tags });
-    return c.json({ versionId, packageName, versionName, tags, narinfoKeys: members, retentionDays, pinned: Boolean(locked.pinned), registeredAt: locked.registered_at }, existing ? 200 : 201);
+    return c.json({ versionId, packageName, versionName, tags, narinfoKeys: members, retentionDays, pinned: Boolean(locked.pinned), registeredAt }, existing ? 200 : 201);
   } finally {
     await releaseObjectWrite(c.env, versionLockKey, versionOwner);
   }
