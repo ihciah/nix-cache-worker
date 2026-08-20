@@ -49,3 +49,4 @@ The RFCs currently recorded are:
 - [RFC-0009: expressive retention rules and visual rule builder](RFC-0009-retention-rule-builder.md)
 - [RFC-0010: consistency and job-recovery hardening](RFC-0010-consistency-and-job-recovery-hardening.md)
 - [RFC-0011: admin retention remaining-time display](RFC-0011-admin-retention-remaining-time.md)
+- [RFC-0012: re-registration renews version age](RFC-0012-reregistration-renews-version-age.md)
