@@ -31,6 +31,13 @@ type FileRow = {
   state: string | null;
 };
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function remainingRetentionDays(row: VersionRow, durationDays: number): number {
+  const expiresAt = Date.parse(row.registered_at) + durationDays * DAY_MS;
+  return Math.max(0, Math.ceil((expiresAt - Date.now()) / DAY_MS));
+}
+
 async function loadPolicies(env: AppEnv["Bindings"]): Promise<PolicyRow[]> {
   const result = await env.DB.prepare("SELECT * FROM gc_policies ORDER BY id").all<PolicyRow>();
   return result.results;
@@ -111,13 +118,16 @@ async function versionSummary(
   const files = await getVersionFiles(env, row.version_id);
   const bytes = files.reduce((sum, file) => sum + (file.size ?? 0), 0);
   const protectedByKeepLatest = protectedIds.has(row.version_id);
+  const retentionDays = effectiveRetentionDays(row, policies, fallback);
+  const isPersistent = row.pinned || protectedByKeepLatest;
   const result: Record<string, unknown> = {
     ...serializeVersion(row),
     fileCount: files.length,
     bytes,
-    effectiveRetentionDays: effectiveRetentionDays(row, policies, fallback),
+    effectiveRetentionDays: retentionDays,
     protectedByKeepLatest,
-    retentionState: row.pinned || protectedByKeepLatest ? "persistent" : `${effectiveRetentionDays(row, policies, fallback)} days`,
+    retentionState: isPersistent ? "persistent" : `${retentionDays} days`,
+    retentionRemainingDays: isPersistent ? null : remainingRetentionDays(row, retentionDays),
   };
   if (includeFiles) result.files = files;
   return result;

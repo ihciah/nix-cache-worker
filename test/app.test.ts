@@ -111,6 +111,7 @@ describe("Admin console page", () => {
     expect(html).toContain('aria-pressed="true"');
     expect(html).toContain("let groupByTags = true");
     expect(html).toContain("function tagGroupLabel(tags)");
+    expect(html).toContain('const formatDaysLeft = (value) => value + (value === 1 ? " day left" : " days left");');
     expect(html).toContain("No tags");
     expect(html).not.toContain('id="guide"');
     expect(html).toContain('id="publishing"');
@@ -330,6 +331,29 @@ describe("Nix cache HTTP API", () => {
     const replay = await register("ttl-package", "2026.1", [pair.narinfoKey], { retentionDays: 3 });
     expect(replay.response.status).toBe(200);
     expect((await replay.response.json<{ registeredAt: string }>()).registeredAt).toBe(first.registeredAt);
+  });
+
+  it("shows finite retention duration and remaining days separately in the admin API", async () => {
+    const packageName = "retention-display-package";
+    const now = Date.now();
+    const versions = [
+      { versionName: "aging", registeredAt: new Date(now - 36 * 60 * 60 * 1000).toISOString() },
+      { versionName: "recent-1", registeredAt: new Date(now - 3 * 60 * 60 * 1000).toISOString() },
+      { versionName: "recent-2", registeredAt: new Date(now - 2 * 60 * 60 * 1000).toISOString() },
+      { versionName: "recent-3", registeredAt: new Date(now - 60 * 60 * 1000).toISOString() },
+    ];
+    for (const version of versions) {
+      await testEnv.DB.prepare(
+        "INSERT INTO artifact_versions (version_id, package_name, version_name, tags_json, retention_days, registered_at, updated_at, state) VALUES (?, ?, ?, '{}', 3, ?, ?, 'active')",
+      ).bind(crypto.randomUUID(), packageName, version.versionName, version.registeredAt, version.registeredAt).run();
+    }
+    const response = await request(`/api/admin/packages/${packageName}`, { headers: bearer("admin-secret") });
+    expect(response.response.status).toBe(200);
+    const body = await response.response.json<{ versions: Array<{ versionName: string; retentionState: string; retentionRemainingDays: number | null; protectedByKeepLatest: boolean }> }>();
+    const aging = body.versions.find((version) => version.versionName === "aging");
+    const protectedVersion = body.versions.find((version) => version.versionName === "recent-3");
+    expect(aging).toMatchObject({ retentionState: "3 days", retentionRemainingDays: 2 });
+    expect(protectedVersion).toMatchObject({ protectedByKeepLatest: true, retentionState: "persistent", retentionRemainingDays: null });
   });
 
   it("exposes package, version, and file hierarchy and targets version operations", async () => {

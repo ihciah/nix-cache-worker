@@ -248,6 +248,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
     const setLoginMessage = (text, type = "") => { const el = $("loginMessage"); el.textContent = text; el.className = "message" + (type ? " " + type : ""); };
     const formatBytes = (value) => { const bytes = Number(value) || 0; if (bytes < 1024) return bytes + " B"; const units = ["KB", "MB", "GB", "TB"]; let size = bytes; let index = -1; do { size /= 1024; index += 1; } while (size >= 1024 && index < units.length - 1); return size.toFixed(size >= 10 ? 0 : 1) + " " + units[index]; };
     const formatDate = (value) => { try { return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" }).format(new Date(value)); } catch { return value || "—"; } };
+    const formatDaysLeft = (value) => value + (value === 1 ? " day left" : " days left");
     const optionalNumber = (value) => value === "" ? null : Number(value);
     function readStoredToken() { try { return window.sessionStorage.getItem(tokenStorageKey) || ""; } catch { return ""; } }
     function storeToken(value) { try { window.sessionStorage.setItem(tokenStorageKey, value); } catch {} }
@@ -317,6 +318,9 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
           const retention = document.createElement("td");
           retention.className = version.retentionState === "persistent" ? "persistent" : "retention";
           retention.textContent = version.retentionState;
+          if (version.retentionRemainingDays !== null && version.retentionRemainingDays !== undefined) {
+            retention.append(document.createElement("br"), document.createTextNode(formatDaysLeft(version.retentionRemainingDays)));
+          }
           versionRow.append(retention);
           const actions = document.createElement("td");
           actions.className = "actions";
