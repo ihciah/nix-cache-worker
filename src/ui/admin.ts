@@ -317,6 +317,9 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
           const retention = document.createElement("td");
           retention.className = version.retentionState === "persistent" ? "persistent" : "retention";
           retention.textContent = version.retentionState;
+          if (version.retentionRemainingDays !== null && version.retentionRemainingDays !== undefined) {
+            retention.append(document.createElement("br"), document.createTextNode(version.retentionRemainingDays + " days left"));
+          }
           versionRow.append(retention);
           const actions = document.createElement("td");
           actions.className = "actions";
