@@ -111,6 +111,7 @@ describe("Admin console page", () => {
     expect(html).toContain('aria-pressed="true"');
     expect(html).toContain("let groupByTags = true");
     expect(html).toContain("function tagGroupLabel(tags)");
+    expect(html).toContain('const formatDaysLeft = (value) => value + (value === 1 ? " day left" : " days left");');
     expect(html).toContain("No tags");
     expect(html).not.toContain('id="guide"');
     expect(html).toContain('id="publishing"');
@@ -348,9 +349,11 @@ describe("Nix cache HTTP API", () => {
     }
     const response = await request(`/api/admin/packages/${packageName}`, { headers: bearer("admin-secret") });
     expect(response.response.status).toBe(200);
-    const body = await response.response.json<{ versions: Array<{ versionName: string; retentionState: string; retentionRemainingDays: number | null }> }>();
+    const body = await response.response.json<{ versions: Array<{ versionName: string; retentionState: string; retentionRemainingDays: number | null; protectedByKeepLatest: boolean }> }>();
     const aging = body.versions.find((version) => version.versionName === "aging");
+    const protectedVersion = body.versions.find((version) => version.versionName === "recent-3");
     expect(aging).toMatchObject({ retentionState: "3 days", retentionRemainingDays: 2 });
+    expect(protectedVersion).toMatchObject({ protectedByKeepLatest: true, retentionState: "persistent", retentionRemainingDays: null });
   });
 
   it("exposes package, version, and file hierarchy and targets version operations", async () => {
